@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tracker-eval"
+version = "0.1.0"
+description = "Run 3D MOT trackers on JRDB detections and record runtime performance; exports predictions for external JRDB toolkit evaluation."
+requires-python = ">=3.8"
+dependencies = [
+  "numpy",
+  # "tqdm",  # keep only if you actually use it anywhere
+]
+
+[project.optional-dependencies]
+# Keep extras focused on *running trackers* within this package.
+# If AB3DMOT is not pip-installable, leave this empty and install AB3DMOT separately on the system.
+ab3dmot = [
+  # Example ONLY if your AB3DMOT fork is installable as a pip package.
+  # Otherwise, do NOT list it here.
+  # "ab3dmot @ git+ssh://git@github.com/<org>/<repo>.git@<commit>",
+]
+
+jetson = [
+  # Put Jetson-specific packages here ONLY if you truly need them.
+  # For example, some people add "pyyaml" or "psutil" for system metrics.
+  # "psutil",
+]
+
+all = [
+  "tracker-eval[jetson,ab3dmot]",
+]
+
+[project.scripts]
+tracker-eval = "tracker_eval.cli.run_tracker:main"

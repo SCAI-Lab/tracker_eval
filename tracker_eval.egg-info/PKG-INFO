@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: tracker-eval
+Version: 0.1.0
+Summary: Run 3D MOT trackers on JRDB detections and record runtime performance; exports predictions for external JRDB toolkit evaluation.
+Requires-Python: >=3.8
+Requires-Dist: numpy
+Provides-Extra: ab3dmot
+Provides-Extra: jetson
+Provides-Extra: all
+Requires-Dist: tracker-eval[ab3dmot,jetson]; extra == "all"

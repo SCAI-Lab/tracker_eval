@@ -1,0 +1,8 @@
+numpy
+
+[ab3dmot]
+
+[all]
+tracker-eval[ab3dmot,jetson]
+
+[jetson]

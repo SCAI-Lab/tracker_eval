@@ -1,0 +1,2 @@
+[console_scripts]
+tracker-eval = tracker_eval.cli.run_tracker:main

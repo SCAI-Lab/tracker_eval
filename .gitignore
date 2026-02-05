@@ -1,0 +1,30 @@
+# Build / install / logs
+build/
+install/
+log/
+devel/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+# OS
+.DS_Store
+
+
+*.mp4
+*.avi
+*.png
+*.jpg
