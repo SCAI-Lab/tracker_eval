@@ -14,7 +14,6 @@ from tracker_eval.data.tracks_io import save_tracks_json
 from tracker_eval.export.jrdb_kitti_writer import (
     TrackRow3D,
     write_sequence_kitti_txt,
-    jrdb_box_from_internal_center,
 )
 
 

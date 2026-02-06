@@ -219,7 +219,7 @@ def run_tracker_on_split(
         raise FileNotFoundError(f"Detections directory not found: {det_dir}")
 
     out_root = Path(out_root)
-    tracker_dir = out_root / tracker_name
+    tracker_dir = out_root / tracker_name / split_name
     out_kitti_dir = tracker_dir / tracker_subfolder
     out_json_dir = tracker_dir / "tracks_json"
 
@@ -347,11 +347,11 @@ def run_tracker_on_split(
     )
 
     # Write summary artifacts
-    summary_json_path = tracker_dir / f"runtime_summary_{split_name}.json"
+    summary_json_path = tracker_dir / "runtime_summary.json"
     _write_json(summary_json_path, asdict(summary))
 
     # CSV only for successful rows (keeps it clean), but we also include skipped with empty metrics
-    csv_path = tracker_dir / f"runtime_summary_{split_name}.csv"
+    csv_path = tracker_dir / "runtime_summary.csv"
     # Choose stable columns
     fieldnames = [
         "seq_name",

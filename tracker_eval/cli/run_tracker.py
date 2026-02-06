@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
+import yaml
 
 from tracker_eval.runner.run_split import run_tracker_on_split
 from tracker_eval.trackers.ab3dmot_adapter import AB3DMOTAdapter, AB3DMOTConfig
@@ -15,30 +15,67 @@ from tracker_eval.trackers.gnnpmbtracker_adapter import GNNPMBAdapter, GNNPMBCon
 from tracker_eval.trackers.cbmot_adapter import CBMOTAdapter, CBMOTConfig
 
 
-
-
 def _parse_list_arg(xs: Optional[List[str]]) -> Optional[List[str]]:
+    """
+    Accept repeated flags and/or comma-separated values.
+
+    Example:
+      --include_sequences a b,c --include_sequences d
+    => ["a", "b", "c", "d"]
+    """
     if xs is None:
         return None
     out: List[str] = []
     for x in xs:
         if x is None:
             continue
-        # allow comma-separated and repeated flags
         parts = [p.strip() for p in str(x).split(",") if p.strip()]
         out.extend(parts)
     return out or None
 
 
+def _normalize_split_names(split_roots: Sequence[str], split_names: Optional[Sequence[str]]) -> List[str]:
+    roots = [Path(r) for r in split_roots]
+    if split_names is None or len(split_names) == 0:
+        return [p.name for p in roots]
+    names = list(split_names)
+    if len(names) == 1 and len(roots) > 1:
+        # If user passes a single name but multiple roots, we interpret it as a prefix base is ambiguous.
+        # Fail loudly so the output structure is unambiguous.
+        raise ValueError(
+            f"--split_name provided once ('{names[0]}') but multiple --split_root were given "
+            f"({len(roots)}). Provide one --split_name per split_root or omit --split_name."
+        )
+    if len(names) != len(roots):
+        raise ValueError(
+            f"Number of --split_name ({len(names)}) must match number of --split_root ({len(roots)})."
+        )
+    return [str(n) for n in names]
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tracker_eval.run_tracker",
-        description="Run a 3D MOT tracker on a JRDB split (Jetson runtime eval + export KITTI txt for JRDB toolkit).",
+        description=(
+            "Run a 3D MOT tracker on one or more JRDB splits (Jetson runtime eval + export KITTI txt for JRDB toolkit)."
+        ),
     )
 
     # IO
-    p.add_argument("--split_root", type=str, required=True, help="Path to split root, e.g. /mnt/nvme/JRDB_track/test")
-    p.add_argument("--split_name", type=str, default=None, help="Name for this split (default: folder name of split_root)")
+    p.add_argument(
+        "--split_root",
+        type=str,
+        nargs="+",
+        required=True,
+        help="One or more split roots, e.g. /mnt/nvme/JRDB_track/train /mnt/nvme/JRDB_track/test",
+    )
+    p.add_argument(
+        "--split_name",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional explicit split name(s). Must match number of split_root if provided.",
+    )
     p.add_argument("--out_root", type=str, required=True, help="Output root directory for tracker outputs")
 
     p.add_argument(
@@ -48,13 +85,13 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Detections subfolder name under split_root (default: detections_3D)",
     )
 
-    # Tracker selection (only AB3DMOT for now)
+    # Tracker selection
     p.add_argument(
         "--tracker",
         type=str,
         default="ab3dmot",
         choices=["ab3dmot", "simpletrack", "fastpoly", "gnnpmb", "cbmot", "elptnet"],
-        help="Tracker to run (currently only: ab3dmot)",
+        help="Tracker to run.",
     )
 
     # Runtime options
@@ -86,7 +123,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--tracker_subfolder",
         type=str,
         default="data",
-        help="Subfolder name under <out_root>/<tracker_name>/ for KITTI txt (default: data)",
+        help="Subfolder name under <out_root>/<tracker_name>/<split_name>/ for KITTI txt (default: data)",
     )
     p.add_argument(
         "--no_kitti_score",
@@ -119,17 +156,20 @@ def build_argparser() -> argparse.ArgumentParser:
         "--simpletrack_config",
         type=str,
         default=None,
-        help="Path to SimpleTrack YAML config (e.g. /home/scai/trackers/SimpleTrack/configs/nu_configs/giou.yaml)",
+        help="Path to SimpleTrack YAML config "
+        "(e.g. /home/scai/trackers/SimpleTrack/configs/nu_configs/giou.yaml)",
     )
 
+    # FastPoly params
     g3 = p.add_argument_group("FastPoly parameters")
     g3.add_argument(
         "--fastpoly_config",
         type=str,
         default=None,
         help="Path to FastPoly YAML config (e.g. /home/scai/trackers/FastPoly/config/nusc_config.yaml)",
-    )   
+    )
 
+    # GNNPMB params
     g4 = p.add_argument_group("GNNPMB parameters")
     g4.add_argument(
         "--gnnpmb_parameters_path",
@@ -167,6 +207,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help="If pedestrian and no measurements, use extractStates_with_custom_thr(thr=...) (default: 0.7).",
     )
 
+    # CBMOT params
     g5 = p.add_argument_group("CBMOT parameters")
     g5.add_argument("--cbmot_hungarian", action="store_true")
     g5.add_argument("--cbmot_max_age", type=int, default=40)
@@ -181,16 +222,19 @@ def build_argparser() -> argparse.ArgumentParser:
     g5.add_argument("--cbmot_track_class", type=str, default="pedestrian")
     g5.add_argument("--cbmot_export_score", action="store_true")
 
+    # ELPTnet params
     g6 = p.add_argument_group("ELPTnet parameters")
-    g6.add_argument("--elptnet_cfg_file", type=str, required=False, default=None,
-                    help="Path to ELPTnet jrdb.yaml")
+    g6.add_argument("--elptnet_cfg_file", type=str, required=False, default=None, help="Path to ELPTnet jrdb.yaml")
     g6.add_argument("--elptnet_fps", type=float, default=15.0)
     g6.add_argument("--elptnet_track_class", type=str, default="pedestrian")
     g6.add_argument("--elptnet_input_score", type=float, default=0.0)
     g6.add_argument("--elptnet_export_score", action="store_true")
-    g6.add_argument("--elptnet_timestamp_mode", type=str, default="frame_index",
-                    choices=["frame_index", "seconds"])
-
+    g6.add_argument(
+        "--elptnet_timestamp_mode",
+        type=str,
+        default="frame_index",
+        choices=["frame_index", "seconds"],
+    )
 
     # Misc
     p.add_argument("--quiet", action="store_true", help="Reduce printing")
@@ -198,18 +242,10 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = build_argparser().parse_args(argv)
-
-    split_root = Path(args.split_root)
-    if args.split_name is None:
-        split_name = split_root.name
-    else:
-        split_name = str(args.split_name)
-
-    include = _parse_list_arg(args.include_sequences)
-    exclude = _parse_list_arg(args.exclude_sequences)
-
+def _build_tracker_and_name(args: argparse.Namespace) -> Tuple[object, str]:
+    """
+    Returns (tracker_instance, tracker_name).
+    """
     if args.tracker == "ab3dmot":
         metrics = tuple([m.strip() for m in str(args.ab3dmot_metrics).split(",") if m.strip()])
         if len(metrics) == 0:
@@ -224,19 +260,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             log_dir=args.ab3dmot_log_dir,
         )
         tracker = AB3DMOTAdapter(cfg=cfg)
-        tracker_name = tracker.name
-    elif args.tracker == "simpletrack":
+        return tracker, tracker.name
+
+    if args.tracker == "simpletrack":
         if args.simpletrack_config is None:
             raise ValueError("--simpletrack_config is required when --tracker simpletrack")
-
         cfg = SimpleTrackConfig(config_path=str(args.simpletrack_config))
         tracker = SimpleTrackAdapter(cfg=cfg)
-        tracker_name = tracker.name
-    elif args.tracker == "fastpoly":
-        import yaml
-        from tracker_eval.trackers.fastpoly_adapter import FastPolyAdapter, FastPolyConfig
+        return tracker, tracker.name
 
-        with open(args.fastpoly_config, "r") as f:
+    if args.tracker == "fastpoly":
+        if args.fastpoly_config is None:
+            raise ValueError("--fastpoly_config is required when --tracker fastpoly")
+        with open(args.fastpoly_config, "r", encoding="utf-8") as f:
             cfg_dict = yaml.safe_load(f)
 
         tracker = FastPolyAdapter(
@@ -248,8 +284,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 use_numeric_frame_id=True,
             )
         )
-        tracker_name = tracker.name
-    elif args.tracker == "gnnpmb":
+        return tracker, tracker.name
+
+    if args.tracker == "gnnpmb":
         if args.gnnpmb_parameters_path is None:
             raise ValueError("--gnnpmb_parameters_path is required when --tracker gnnpmb")
 
@@ -263,8 +300,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ped_empty_meas_extract_thr=float(args.gnnpmb_ped_empty_meas_extract_thr),
             )
         )
-        tracker_name = tracker.name
-    elif args.tracker == "cbmot":
+        return tracker, tracker.name
+
+    if args.tracker == "cbmot":
         cfg = CBMOTConfig(
             hungarian=bool(args.cbmot_hungarian),
             max_age=int(args.cbmot_max_age),
@@ -280,11 +318,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             export_score=bool(args.cbmot_export_score),
         )
         tracker = CBMOTAdapter(cfg=cfg)
-        tracker_name = tracker.name
-    elif args.tracker == "elptnet":
+        return tracker, tracker.name
+
+    if args.tracker == "elptnet":
         if args.elptnet_cfg_file is None:
             raise ValueError("--elptnet_cfg_file is required when --tracker elptnet")
-
         from tracker_eval.trackers.elptnet_adapter import ELPTnetAdapter, ELPTnetConfig
 
         cfg = ELPTnetConfig(
@@ -296,45 +334,64 @@ def main(argv: Optional[List[str]] = None) -> int:
             timestamp_mode=str(args.elptnet_timestamp_mode),
         )
         tracker = ELPTnetAdapter(cfg=cfg)
-        tracker_name = tracker.name
-    else:
-        raise ValueError(f"Unsupported tracker: {args.tracker}")
+        return tracker, tracker.name
 
-    summary = run_tracker_on_split(
-        split_root=str(split_root),
-        split_name=split_name,
-        tracker=tracker,
-        tracker_name=tracker_name,
-        out_root=str(args.out_root),
-        detections_subdir=str(args.detections_subdir),
-        warmup_steps=int(args.warmup_steps),
-        limit_sequences=int(args.limit_sequences) if args.limit_sequences is not None else None,
-        include_sequences=include,
-        exclude_sequences=exclude,
-        write_kitti_txt=True,
-        write_tracks_json=bool(args.write_tracks_json),
-        kitti_use_score=not bool(args.no_kitti_score),
-        tracker_subfolder=str(args.tracker_subfolder),
-        skip_existing_kitti=not bool(args.no_skip_existing),
-        verbose=not bool(args.quiet),
-    )
+    raise ValueError(f"Unsupported tracker: {args.tracker}")
 
-    # Print a concise end-of-run summary
-    agg = summary.aggregate
-    tracker_dir = summary.io.get("tracker_dir", "")
-    kitti_dir = summary.io.get("kitti_dir", "")
 
-    if not args.quiet:
-        fps_w = agg.get("fps", {}).get("frame_weighted", 0.0)
-        mean_ms = agg.get("step_ms", {}).get("mean_of_mean", 0.0)
-        nseq = agg.get("num_sequences", 0)
-        nframes = agg.get("num_frames_total", 0)
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_argparser().parse_args(argv)
+
+    split_roots: List[str] = [str(s) for s in args.split_root]
+    split_names: List[str] = _normalize_split_names(split_roots, args.split_name)
+
+    include = _parse_list_arg(args.include_sequences)
+    exclude = _parse_list_arg(args.exclude_sequences)
+
+    tracker, tracker_name = _build_tracker_and_name(args)
+
+    # Run each split sequentially
+    all_summaries = []
+    for split_root, split_name in zip(split_roots, split_names):
+        summary = run_tracker_on_split(
+            split_root=str(split_root),
+            split_name=str(split_name),
+            tracker=tracker,
+            tracker_name=tracker_name,
+            out_root=str(args.out_root),
+            detections_subdir=str(args.detections_subdir),
+            warmup_steps=int(args.warmup_steps),
+            limit_sequences=int(args.limit_sequences) if args.limit_sequences is not None else None,
+            include_sequences=include,
+            exclude_sequences=exclude,
+            write_kitti_txt=True,
+            write_tracks_json=bool(args.write_tracks_json),
+            kitti_use_score=not bool(args.no_kitti_score),
+            tracker_subfolder=str(args.tracker_subfolder),
+            skip_existing_kitti=not bool(args.no_skip_existing),
+            verbose=not bool(args.quiet),
+        )
+        all_summaries.append(summary)
+
+        if not args.quiet:
+            agg = summary.aggregate
+            fps_w = agg.get("fps", {}).get("frame_weighted", 0.0)
+            mean_ms = agg.get("step_ms", {}).get("mean_of_mean", 0.0)
+            nseq = agg.get("num_sequences", 0)
+            nframes = agg.get("num_frames_total", 0)
+            tracker_dir = summary.io.get("tracker_dir", "")
+            kitti_dir = summary.io.get("kitti_dir", "")
+            print("")
+            print("[tracker_eval] Done split:", split_name)
+            print(f"[tracker_eval] Sequences run: {nseq} | Frames total: {nframes}")
+            print(f"[tracker_eval] FPS (frame-weighted): {fps_w:.2f} | Mean step (mean-of-mean): {mean_ms:.2f} ms")
+            print(f"[tracker_eval] Outputs: {tracker_dir}")
+            print(f"[tracker_eval] KITTI txt: {kitti_dir}")
+
+    # Optional: print a tiny combined note (no extra file written here, per your request)
+    if (not args.quiet) and len(all_summaries) > 1:
         print("")
-        print("[tracker_eval] Done.")
-        print(f"[tracker_eval] Sequences run: {nseq} | Frames total: {nframes}")
-        print(f"[tracker_eval] FPS (frame-weighted): {fps_w:.2f} | Mean step (mean-of-mean): {mean_ms:.2f} ms")
-        print(f"[tracker_eval] Outputs: {tracker_dir}")
-        print(f"[tracker_eval] KITTI txt: {kitti_dir}")
+        print(f"[tracker_eval] Completed {len(all_summaries)} splits for tracker '{tracker_name}'.")
 
     return 0
 
