@@ -1,0 +1,15 @@
+python -m tracker_eval.cli.viz_tracks \
+  --out_root /mnt/nvme/tracker_eval_outputs \
+  --tracker headroom \
+  --split_name test \
+  --sequence tressider-2019-04-26_3 \
+  --out_dir /mnt/nvme/tracker_eval_outputs/headroom/viz \
+  --gt_tracker_name GT \
+  --gt_subfolder data \
+  --pred_subfolder data \
+  --mode boxes \
+  --xlim_xy -10 10 --ylim_xy -10 10 \
+  --xlim_xz -10 10 --ylim_xz -1 2.5 \
+  --xlim_yz -10 10 --ylim_yz -1 2.5 \
+  --fps 15 \
+  --dpi 100 

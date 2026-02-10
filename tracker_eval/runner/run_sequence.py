@@ -8,13 +8,10 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple
 
 import numpy as np
 
-from tracker_eval.common.types import Box3D, Detection, FrameData, frame_sort_key
+from tracker_eval.common.types import Detection, FrameData, frame_sort_key
 from tracker_eval.data.jrdb_io import load_jrdb_detections_3d
 from tracker_eval.data.tracks_io import save_tracks_json
-from tracker_eval.export.jrdb_kitti_writer import (
-    TrackRow3D,
-    write_sequence_kitti_txt,
-)
+from tracker_eval.export.jrdb_kitti_writer import TrackRow3D, write_sequence_kitti_txt
 
 
 # ----------------------------
@@ -29,23 +26,18 @@ class Tracker3D(Protocol):
       - reset_sequence(seq_name) -> None
       - step(frame_id, detections, timestamp=None) -> FrameData
 
+    Optional (for GT-assisted / headroom trackers):
+      - set_gt_for_sequence(gt_by_frame: Dict[str, FrameData]) -> None
+      OR
+      - step_with_gt(frame_id, detections: List[Detection], gt: List[Detection], timestamp=None) -> FrameData
+
     Backward-compatible support:
       - reset() -> None
       - step(frame_id, detections: List[Detection]) -> List[Detection]
     """
 
-    # Preferred API (matches TrackerBase)
-    def reset_sequence(self, seq_name: str) -> None:
-        ...
-
-    def step(
-        self,
-        frame_id: str,
-        detections: Any,
-        *,
-        timestamp: Optional[float] = None,
-    ) -> Any:
-        ...
+    def reset_sequence(self, seq_name: str) -> None: ...
+    def step(self, frame_id: str, detections: Any, *, timestamp: Optional[float] = None) -> Any: ...
 
 
 # ----------------------------
@@ -84,8 +76,9 @@ def _percentile(values: List[float], q: float) -> float:
 
 
 # ----------------------------
-# Core runner
+# Core runner helpers
 # ----------------------------
+
 def _tracker_reset_sequence(tracker: Any, seq_name: str) -> None:
     """
     Prefer TrackerBase-style reset_sequence(seq_name).
@@ -100,12 +93,47 @@ def _tracker_reset_sequence(tracker: Any, seq_name: str) -> None:
     raise AttributeError("Tracker must implement reset_sequence(seq_name) or reset().")
 
 
-def _tracker_step(tracker: Any, frame_id: str, dets: List[Detection]) -> FrameData:
+def _maybe_set_gt_for_sequence(tracker: Any, gt_by_frame: Optional[Mapping[str, FrameData]]) -> None:
     """
-    Prefer TrackerBase-style step(...) -> FrameData.
-    Fall back to legacy step(...) -> List[Detection].
+    If tracker supports set_gt_for_sequence(...), preload GT once per sequence.
+    This is the cleanest integration for GT-assisted trackers (e.g. headroom).
     """
-    out = tracker.step(frame_id, dets)
+    if gt_by_frame is None:
+        return
+    if hasattr(tracker, "set_gt_for_sequence"):
+        tracker.set_gt_for_sequence(dict(gt_by_frame))  # type: ignore[attr-defined]
+
+
+def _tracker_step(
+    tracker: Any,
+    frame_id: str,
+    dets: List[Detection],
+    *,
+    timestamp: Optional[float] = None,
+    gt_dets: Optional[List[Detection]] = None,
+) -> FrameData:
+    """
+    Prefer TrackerBase-style:
+      - step(frame_id, dets, timestamp=...)
+    Optional GT-assisted:
+      - step_with_gt(frame_id, dets, gt_dets, timestamp=...)
+    Fall back to legacy:
+      - step(frame_id, dets) -> List[Detection]
+    """
+    # GT-assisted path if available and gt is provided
+    if gt_dets is not None and hasattr(tracker, "step_with_gt"):
+        try:
+            out = tracker.step_with_gt(frame_id, dets, gt_dets, timestamp=timestamp)  # type: ignore[attr-defined]
+        except TypeError:
+            # older signature without timestamp
+            out = tracker.step_with_gt(frame_id, dets, gt_dets)  # type: ignore[attr-defined]
+    else:
+        # Normal step
+        try:
+            out = tracker.step(frame_id, dets, timestamp=timestamp)
+        except TypeError:
+            # legacy trackers not accepting timestamp kwarg
+            out = tracker.step(frame_id, dets)
 
     # TrackerBase returns FrameData
     if isinstance(out, FrameData):
@@ -120,6 +148,11 @@ def _tracker_step(tracker: Any, frame_id: str, dets: List[Detection]) -> FrameDa
         f"Got: {type(out)}"
     )
 
+
+# ----------------------------
+# Core runner
+# ----------------------------
+
 def run_tracker_on_sequence(
     *,
     seq_name: str,
@@ -127,15 +160,21 @@ def run_tracker_on_sequence(
     tracker: Tracker3D,
     frames: Optional[List[str]] = None,
     warmup_steps: int = 0,
+    gt_by_frame: Optional[Mapping[str, FrameData]] = None,
+    timestamps_by_frame: Optional[Mapping[str, float]] = None,
 ) -> Tuple[Dict[str, FrameData], SequenceRunStats]:
     """
     Run a tracker on a sequence's detections.
 
-    This runner supports two tracker styles:
+    Supported tracker styles:
 
     Preferred (TrackerBase-style):
       - tracker.reset_sequence(seq_name)
       - tracker.step(frame_id, detections, timestamp=None) -> FrameData
+
+    Optional GT-assisted:
+      - tracker.set_gt_for_sequence(gt_by_frame)   (called once per sequence), and/or
+      - tracker.step_with_gt(frame_id, dets, gt_dets, timestamp=None) -> FrameData
 
     Legacy:
       - tracker.reset()
@@ -153,6 +192,10 @@ def run_tracker_on_sequence(
         Optional explicit frame ordering. If None, inferred and sorted.
     warmup_steps:
         Number of initial frames to run but exclude from timing stats.
+    gt_by_frame:
+        Optional GT mapping frame_id -> FrameData. Used only by GT-assisted trackers.
+    timestamps_by_frame:
+        Optional mapping frame_id -> timestamp_s (float). If omitted, timestamp=None is passed.
 
     Returns
     -------
@@ -161,13 +204,18 @@ def run_tracker_on_sequence(
     stats:
         timing stats (fps etc.)
     """
-    # Reset tracker for this sequence (prefers reset_sequence, falls back to reset)
+    # Reset tracker for this sequence
     _tracker_reset_sequence(tracker, seq_name)
+
+    # Preload GT if tracker supports it
+    _maybe_set_gt_for_sequence(tracker, gt_by_frame)
 
     # Determine frame ordering
     if frames is None:
-        frames = list(detections_by_frame.keys())
-        frames.sort(key=frame_sort_key)
+        keys = set(detections_by_frame.keys())
+        if gt_by_frame is not None:
+            keys |= set(gt_by_frame.keys())
+        frames = sorted(keys, key=frame_sort_key)
 
     # Run
     step_times_ms: List[float] = []
@@ -176,9 +224,16 @@ def run_tracker_on_sequence(
     t0 = time.perf_counter()
     for i, frame_id in enumerate(frames):
         dets = detections_by_frame.get(frame_id, FrameData(frame_id=frame_id, dets=[])).dets
+        gt_dets = None
+        if gt_by_frame is not None:
+            gt_dets = gt_by_frame.get(frame_id, FrameData(frame_id=frame_id, dets=[])).dets
+
+        ts_frame = None
+        if timestamps_by_frame is not None:
+            ts_frame = timestamps_by_frame.get(frame_id, None)
 
         ts = time.perf_counter()
-        tracked_fd = _tracker_step(tracker, frame_id, dets)  # -> FrameData
+        tracked_fd = _tracker_step(tracker, frame_id, dets, timestamp=ts_frame, gt_dets=gt_dets)
         te = time.perf_counter()
 
         # Ensure frame_id is consistent
@@ -218,7 +273,6 @@ def run_tracker_on_sequence(
     return tracks_by_frame, stats
 
 
-
 # ----------------------------
 # Export helpers for JRDB toolkit
 # ----------------------------
@@ -233,7 +287,6 @@ def tracks_by_frame_to_kitti_rows(
 
     Important:
     - Our internal Box3D is center-based (cx,cy,cz,l,w,h,rot_z).
-    - JRDB toolkit 3D IoU code expects y_top = cy + h/2 (we convert in writer helper).
     """
     out: Dict[str, List[TrackRow3D]] = {}
     for frame_id, fd in tracks_by_frame.items():
@@ -271,10 +324,7 @@ def write_sequence_outputs(
         )
 
     if out_kitti_txt is not None:
-        # convert to expected writer input
         rows_by_frame = tracks_by_frame_to_kitti_rows(tracks_by_frame)
-
-        # writer expects mapping frame->list[TrackRow3D]
         write_sequence_kitti_txt(
             out_txt_path=out_kitti_txt,
             tracks_by_frame=rows_by_frame,
@@ -298,16 +348,30 @@ def run_tracker_from_detections_json(
     detections_json_path: str,
     tracker: Tracker3D,
     warmup_steps: int = 0,
+    gt_by_frame: Optional[Mapping[str, FrameData]] = None,
+    timestamps_by_frame: Optional[Mapping[str, float]] = None,
 ) -> Tuple[Dict[str, FrameData], SequenceRunStats]:
     """
     Load a MinkUNet detections_3D JSON and run tracker.
+
+    Optional:
+      - gt_by_frame: pass GT frames if you run a GT-assisted tracker (e.g., headroom)
+      - timestamps_by_frame: if you have real timestamps
     """
     dets_by_frame = load_jrdb_detections_3d(detections_json_path)
-    frames = sorted(dets_by_frame.keys(), key=frame_sort_key)
+
+    # Default frame order: union of det and gt frames (if GT provided)
+    keys = set(dets_by_frame.keys())
+    if gt_by_frame is not None:
+        keys |= set(gt_by_frame.keys())
+    frames = sorted(keys, key=frame_sort_key)
+
     return run_tracker_on_sequence(
         seq_name=seq_name,
         detections_by_frame=dets_by_frame,
         tracker=tracker,
         frames=frames,
         warmup_steps=warmup_steps,
+        gt_by_frame=gt_by_frame,
+        timestamps_by_frame=timestamps_by_frame,
     )

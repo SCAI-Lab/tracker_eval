@@ -13,6 +13,8 @@ from tracker_eval.trackers.simpletrack_adapter import SimpleTrackAdapter, Simple
 from tracker_eval.trackers.fastpoly_adapter import FastPolyAdapter, FastPolyConfig
 from tracker_eval.trackers.gnnpmbtracker_adapter import GNNPMBAdapter, GNNPMBConfig
 from tracker_eval.trackers.cbmot_adapter import CBMOTAdapter, CBMOTConfig
+from tracker_eval.trackers.headroom_adapter import HeadroomAdapter, HeadroomConfig
+
 
 
 def _parse_list_arg(xs: Optional[List[str]]) -> Optional[List[str]]:
@@ -85,12 +87,20 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Detections subfolder name under split_root (default: detections_3D)",
     )
 
+    p.add_argument(
+        "--labels_subdir",
+        type=str,
+        default="labels_3d",
+        help="GT labels subfolder name under split_root (default: labels_3d). Used by headroom.",
+    )
+
+
     # Tracker selection
     p.add_argument(
         "--tracker",
         type=str,
         default="ab3dmot",
-        choices=["ab3dmot", "simpletrack", "fastpoly", "gnnpmb", "cbmot", "elptnet"],
+        choices=["ab3dmot", "simpletrack", "fastpoly", "gnnpmb", "cbmot", "elptnet", "headroom"],
         help="Tracker to run.",
     )
 
@@ -236,6 +246,44 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["frame_index", "seconds"],
     )
 
+    g7 = p.add_argument_group("Headroom parameters")
+
+    # time
+    g7.add_argument("--headroom_fps", type=float, default=15.0)
+
+    # reid / lifetime
+    g7.add_argument("--headroom_T_reid_base_s", type=float, default=1.0)
+    g7.add_argument("--headroom_T_reid_static_s", type=float, default=2.0)
+
+    # evidence model (new)
+    g7.add_argument("--headroom_score_floor", type=float, default=0.5)
+    g7.add_argument("--headroom_score_power", type=float, default=1.7)
+    g7.add_argument("--headroom_tau_hit_s", type=float, default=0.20)
+    g7.add_argument("--headroom_tau_miss_s", type=float, default=0.60)
+    g7.add_argument("--headroom_theta_on", type=float, default=0.55)
+    g7.add_argument("--headroom_theta_off", type=float, default=0.35)
+    g7.add_argument("--headroom_min_hits", type=int, default=2)
+
+    # output coasting (still there)
+    g7.add_argument("--headroom_T_out_min_s", type=float, default=0.10)
+    g7.add_argument("--headroom_T_out_max_s", type=float, default=0.50)
+    g7.add_argument("--headroom_T_out_gamma", type=float, default=1.5)
+
+    # association (new-ish)
+    g7.add_argument("--headroom_dist_gate_m", type=float, default=0.35)
+    g7.add_argument("--headroom_z_gate_m", type=float, default=1.0)
+    g7.add_argument("--headroom_assoc_topk", type=int, default=10)
+    g7.add_argument("--headroom_assoc_iou_weight", type=float, default=10.0)
+
+    # static inference (same)
+    g7.add_argument("--headroom_v_static_thr_mps", type=float, default=0.10)
+    g7.add_argument("--headroom_jitter_thr_m", type=float, default=0.20)
+    g7.add_argument("--headroom_static_window", type=int, default=10)
+
+    # ids (new, usually leave default)
+    g7.add_argument("--headroom_gt_stride", type=int, default=100000)
+    g7.add_argument("--headroom_fp_offset", type=int, default=10000000)
+
     # Misc
     p.add_argument("--quiet", action="store_true", help="Reduce printing")
 
@@ -335,6 +383,45 @@ def _build_tracker_and_name(args: argparse.Namespace) -> Tuple[object, str]:
         )
         tracker = ELPTnetAdapter(cfg=cfg)
         return tracker, tracker.name
+    
+    if args.tracker == "headroom":
+        cfg = HeadroomConfig(
+            fps=float(args.headroom_fps),
+
+            T_reid_base_s=float(args.headroom_T_reid_base_s),
+            T_reid_static_s=float(args.headroom_T_reid_static_s),
+
+            # evidence (new)
+            score_floor=float(args.headroom_score_floor),
+            score_power=float(args.headroom_score_power),
+            tau_hit_s=float(args.headroom_tau_hit_s),
+            tau_miss_s=float(args.headroom_tau_miss_s),
+            theta_on=float(args.headroom_theta_on),
+            theta_off=float(args.headroom_theta_off),
+            min_hits=int(args.headroom_min_hits),
+
+            # output
+            T_out_min_s=float(args.headroom_T_out_min_s),
+            T_out_max_s=float(args.headroom_T_out_max_s),
+            T_out_gamma=float(args.headroom_T_out_gamma),
+
+            # association
+            dist_gate_m=float(args.headroom_dist_gate_m),
+            z_gate_m=float(args.headroom_z_gate_m),
+            assoc_topk=int(args.headroom_assoc_topk),
+            assoc_iou_weight=float(args.headroom_assoc_iou_weight),
+
+            # static
+            v_static_thr_mps=float(args.headroom_v_static_thr_mps),
+            jitter_thr_m=float(args.headroom_jitter_thr_m),
+            static_window=int(args.headroom_static_window),
+
+            # ids
+            gt_stride=int(args.headroom_gt_stride),
+            fp_offset=int(args.headroom_fp_offset),
+        )
+        tracker = HeadroomAdapter(cfg=cfg)
+        return tracker, tracker.name
 
     raise ValueError(f"Unsupported tracker: {args.tracker}")
 
@@ -360,6 +447,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             tracker_name=tracker_name,
             out_root=str(args.out_root),
             detections_subdir=str(args.detections_subdir),
+            labels_subdir=str(args.labels_subdir),
             warmup_steps=int(args.warmup_steps),
             limit_sequences=int(args.limit_sequences) if args.limit_sequences is not None else None,
             include_sequences=include,

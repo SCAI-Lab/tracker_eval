@@ -12,7 +12,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from tracker_eval.common.types import frame_sort_key
-from tracker_eval.data.jrdb_io import list_sequence_jsons, sequence_name_from_json_filename
+from tracker_eval.data.jrdb_io import (
+    list_sequence_jsons,
+    sequence_name_from_json_filename,
+    load_jrdb_labels_3d,   # <-- add
+)
+
 from tracker_eval.runner.run_sequence import (
     SequenceRunStats,
     run_tracker_from_detections_json,
@@ -160,6 +165,9 @@ def run_tracker_on_split(
     tracker_name: str,
     out_root: Union[str, Path],
     detections_subdir: str = "detections_3D",
+    labels_subdir: str = "labels_3d",
+    use_gt_if_available: bool = True,
+
     # Runtime options
     warmup_steps: int = 0,
     limit_sequences: Optional[int] = None,
@@ -278,6 +286,15 @@ def run_tracker_on_split(
 
         if verbose:
             print(f"[tracker_eval] ({idx+1}/{len(seqs)}) Running {seq_name} ...")
+        
+        gt_by_frame = None
+        if use_gt_if_available and hasattr(tracker, "step_with_gt"):
+            gt_json_path = split_root / labels_subdir / f"{seq_name}.json"
+            if gt_json_path.exists():
+                gt_by_frame = load_jrdb_labels_3d(str(gt_json_path))
+            else:
+                if verbose:
+                    print(f"[tracker_eval]   NOTE: GT not found for headroom: {gt_json_path} (running without GT)")
 
         # Run sequence
         tracks_by_frame, stats = run_tracker_from_detections_json(
@@ -285,7 +302,9 @@ def run_tracker_on_split(
             detections_json_path=str(det_json_path),
             tracker=tracker,
             warmup_steps=warmup_steps,
+            gt_by_frame=gt_by_frame,   # <-- add
         )
+
 
         # Write outputs
         meta = {
@@ -294,6 +313,7 @@ def run_tracker_on_split(
             "tracker_name": tracker_name,
             "warmup_steps": int(warmup_steps),
             "detections_json": str(det_json_path),
+            "gt_json": str(gt_json_path) if gt_by_frame is not None else "",
         }
 
         write_sequence_outputs(
