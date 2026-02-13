@@ -20,7 +20,7 @@ class FastPolyConfig:
     directly, and we only override the bare minimum fields needed for single-seq usage.
     """
     # The FastPoly YAML config dict (already loaded with yaml.safe_load)
-    config: Dict[str, Any]
+    config: Dict[str, Any] = "/home/scai/trackers/FastPoly/config/nusc_config.yaml"
 
     # Sequence id used by FastPoly internal outputs
     # (FastPoly wants data_info['seq_id'] to exist)

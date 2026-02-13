@@ -37,11 +37,11 @@ class ELPTnetConfig:
         "frame_index" -> timestamp=int(frame_idx)
         "seconds"     -> timestamp=int(round(frame_idx / fps))  (still int and consecutive-ish)
     """
-    cfg_file: str
+    cfg_file: str = "/home/scai/trackers/ELPTNet/jrdb.yaml"
     fps: float = 15.0
 
     track_class: str = "pedestrian"
-    input_score: float = 0.0
+    input_score: float = 0.5
     export_score: bool = False
 
     timestamp_mode: str = "frame_index"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Iterable, Set
+from typing import Dict, List, Optional, Sequence, Tuple, Set
 
 import math
 import numpy as np
@@ -9,159 +9,15 @@ import numpy as np
 from tracker_eval.common.types import Box3D, Detection, FrameData
 from tracker_eval.trackers.base import TrackerBase, TrackerInfo, TrackerRunConfig
 
-# Optional (fast) LAP solver
-try:
-    from scipy.optimize import linear_sum_assignment  # type: ignore
-except Exception:  # pragma: no cover
-    linear_sum_assignment = None  # type: ignore
-
-# Optional (fast) neighbor queries
-try:
-    from scipy.spatial import cKDTree  # type: ignore
-except Exception:  # pragma: no cover
-    cKDTree = None  # type: ignore
-
-
-# -----------------------------
-# Geometry: BEV oriented IoU
-# -----------------------------
-
-def _wrap_to_pi(a: float) -> float:
-    a = float(a)
-    return (a + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def _rect_corners_xy(cx: float, cy: float, l: float, w: float, yaw: float) -> np.ndarray:
-    """Return (4,2) rectangle corners CCW in XY."""
-    dx = 0.5 * float(l)
-    dy = 0.5 * float(w)
-    local = np.array([[ dx,  dy],
-                      [ dx, -dy],
-                      [-dx, -dy],
-                      [-dx,  dy]], dtype=np.float64)
-    c = math.cos(float(yaw))
-    s = math.sin(float(yaw))
-    R = np.array([[c, -s],
-                  [s,  c]], dtype=np.float64)
-    pts = local @ R.T
-    pts[:, 0] += float(cx)
-    pts[:, 1] += float(cy)
-    return pts
-
-
-def _poly_area(poly: np.ndarray) -> float:
-    """Shoelace area for polygon (N,2). Assumes points ordered."""
-    if poly is None or len(poly) < 3:
-        return 0.0
-    x = poly[:, 0]
-    y = poly[:, 1]
-    return 0.5 * float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
-
-
-def _is_inside(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> bool:
-    """Check if point p is inside the half-plane to the left of edge a->b (CCW)."""
-    return float((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) >= -1e-12
-
-
-def _line_intersection(p1: np.ndarray, p2: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Intersection of segment p1->p2 with infinite line a->b, assuming they are not parallel."""
-    x1, y1 = float(p1[0]), float(p1[1])
-    x2, y2 = float(p2[0]), float(p2[1])
-    x3, y3 = float(a[0]), float(a[1])
-    x4, y4 = float(b[0]), float(b[1])
-
-    den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    if abs(den) < 1e-12:
-        return p2.copy()
-
-    px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / den
-    py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / den
-    return np.array([px, py], dtype=np.float64)
-
-
-def _sutherland_hodgman_clip(subject: np.ndarray, clip: np.ndarray) -> np.ndarray:
-    """
-    Clip a convex subject polygon by a convex clip polygon (both CCW).
-    Returns intersection polygon points (K,2).
-    """
-    if subject is None or len(subject) == 0:
-        return np.zeros((0, 2), dtype=np.float64)
-
-    output = subject.copy()
-    for i in range(len(clip)):
-        a = clip[i]
-        b = clip[(i + 1) % len(clip)]
-        input_list = output
-        if len(input_list) == 0:
-            break
-        out_pts = []
-        s = input_list[-1]
-        for e in input_list:
-            if _is_inside(e, a, b):
-                if not _is_inside(s, a, b):
-                    out_pts.append(_line_intersection(s, e, a, b))
-                out_pts.append(e)
-            elif _is_inside(s, a, b):
-                out_pts.append(_line_intersection(s, e, a, b))
-            s = e
-        output = np.array(out_pts, dtype=np.float64) if len(out_pts) > 0 else np.zeros((0, 2), dtype=np.float64)
-    return output
-
-
-def bev_iou_oriented(a: Box3D, b: Box3D) -> float:
-    """Oriented rectangle IoU in XY (ignores z)."""
-    pa = _rect_corners_xy(a.cx, a.cy, a.l, a.w, a.rot_z)
-    pb = _rect_corners_xy(b.cx, b.cy, b.l, b.w, b.rot_z)
-    ia = _poly_area(pa)
-    ib = _poly_area(pb)
-    if ia <= 0.0 or ib <= 0.0:
-        return 0.0
-    inter_poly = _sutherland_hodgman_clip(pa, pb)
-    inter = _poly_area(inter_poly)
-    union = ia + ib - inter
-    if union <= 0.0:
-        return 0.0
-    return float(max(0.0, min(1.0, inter / union)))
-
-
-def _precompute_bev_rects(boxes: Sequence[Box3D]) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Precompute BEV rectangle corners and areas for a list of Box3D.
-    Returns:
-      corners: (N,4,2) float64
-      areas:   (N,) float64
-    """
-    n = len(boxes)
-    if n == 0:
-        return np.zeros((0, 4, 2), dtype=np.float64), np.zeros((0,), dtype=np.float64)
-
-    corners = np.zeros((n, 4, 2), dtype=np.float64)
-    areas = np.zeros((n,), dtype=np.float64)
-    for i, b in enumerate(boxes):
-        c = _rect_corners_xy(b.cx, b.cy, b.l, b.w, b.rot_z)
-        corners[i] = c
-        areas[i] = _poly_area(c)
-    return corners, areas
-
-
-def bev_iou_oriented_cached(
-    corners_a: np.ndarray, area_a: float,
-    corners_b: np.ndarray, area_b: float,
-) -> float:
-    """Oriented IoU in XY using precomputed corners/areas."""
-    if area_a <= 0.0 or area_b <= 0.0:
-        return 0.0
-    inter_poly = _sutherland_hodgman_clip(corners_a, corners_b)
-    inter = _poly_area(inter_poly)
-    union = area_a + area_b - inter
-    if union <= 0.0:
-        return 0.0
-    x = inter / union
-    if x < 0.0:
-        return 0.0
-    if x > 1.0:
-        return 1.0
-    return float(x)
+from tracker_eval.utils import (
+    linear_sum_assignment,
+    cKDTree,
+    _precompute_bev_rects,
+    bev_iou_oriented_cached,
+    _UnionFind,
+    _build_candidates,
+    _assign_component_hungarian,
+)
 
 
 # -----------------------------
@@ -190,38 +46,37 @@ class HeadroomConfig:
     fps: float = 15.0
 
     # Association gating (distance-only, optional z)
-    dist_gate_m: float = 0.35
+    dist_gate_m: float = 0.4
     z_gate_m: float = 1.0  # set <=0 to disable
 
     # Candidate pruning (speed)
     assoc_topk: int = 10  # max candidates per track (after radius query)
 
     # Assignment cost: cost = (1 - iou) * assoc_iou_weight + dist
-    assoc_iou_weight: float = 10.0
+    assoc_iou_weight: float = 0.5
     forbidden_cost: float = 1e6  # used for non-edges in Hungarian
 
     # Evidence model (smoothed score + miss decay + hysteresis)
     score_floor: float = 0.50     # scores <= floor contribute ~0 evidence
-    score_power: float = 1.7      # x = s_norm^p
-    tau_hit_s: float = 0.20       # evidence rise time constant (seconds)
-    tau_miss_s: float = 0.60      # evidence decay time constant (seconds)
-    theta_on: float = 0.55        # confirm threshold
-    theta_off: float = 0.35       # deconfirm threshold (hysteresis)
+    score_power: float = 1.5      # x = s_norm^p
+    tau_hit_s: float = 0.1       # evidence rise time constant (seconds)
+    tau_miss_s: float = 2.0      # evidence decay time constant (seconds)
+    theta_on: float = 0.5        # confirm threshold
     min_hits: int = 2             # min matched detections before first confirmation
 
     # Output coasting after miss (seconds), based on CURRENT evidence (not peak)
-    T_out_min_s: float = 0.10
-    T_out_max_s: float = 0.50
-    T_out_gamma: float = 1.5
+    T_out_min_s: float = 0.30
+    T_out_max_s: float = 1.0
+    T_out_gamma: float = 1.0
 
     # ReID / forgetting (seconds), independent of evidence
     T_reid_base_s: float = 1.0
     T_reid_static_s: float = 2.0
 
     # Static inference from observed history only (detections only)
-    static_window: int = 10
-    v_static_thr_mps: float = 0.10
-    jitter_thr_m: float = 0.20
+    static_window: int = 15
+    v_static_thr_mps: float = 0.20
+    jitter_thr_m: float = 0.15
     vel_ema_beta: float = 0.8
 
     # Prediction when GT displacement is not available (and for FP tracks)
@@ -233,34 +88,6 @@ class HeadroomConfig:
     # ID namespaces
     gt_stride: int = 100_000
     fp_offset: int = 10_000_000
-
-
-# -----------------------------
-# Small utilities
-# -----------------------------
-
-class _UnionFind:
-    def __init__(self, n: int) -> None:
-        self.parent = list(range(n))
-        self.rank = [0] * n
-
-    def find(self, x: int) -> int:
-        while self.parent[x] != x:
-            self.parent[x] = self.parent[self.parent[x]]
-            x = self.parent[x]
-        return x
-
-    def union(self, a: int, b: int) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra == rb:
-            return
-        if self.rank[ra] < self.rank[rb]:
-            self.parent[ra] = rb
-        elif self.rank[ra] > self.rank[rb]:
-            self.parent[rb] = ra
-        else:
-            self.parent[rb] = ra
-            self.rank[ra] += 1
 
 
 # -----------------------------
@@ -341,7 +168,7 @@ class HeadroomAdapter(TrackerBase):
       3) Remaining detections are matched to FP-family tracks similarly; remaining detections spawn FP tracks.
       4) Evidence model uses only detector score:
          - smoothed evidence with tau_hit/tau_miss
-         - confirmation with hysteresis (theta_on/theta_off) and min_hits
+         - confirmation with hysteresis (theta_on) and min_hits
       5) On misses:
          - GT-family tracks coast using GT displacement when available (oracle motion)
          - FP tracks coast using constant velocity from detections only (optional)
@@ -534,178 +361,6 @@ class HeadroomAdapter(TrackerBase):
             )
 
     # -----------------------------
-    # Gating + candidate generation
-    # -----------------------------
-
-    def _gate_pair_distance_only(self, box_tr: Box3D, box_det: Box3D) -> Tuple[bool, float]:
-        """
-        Distance-only gate (+ optional z).
-        Returns (ok, dist_xy).
-        """
-        cfg = self.cfg
-        if float(cfg.z_gate_m) > 0.0:
-            if abs(float(box_tr.cz - box_det.cz)) > float(cfg.z_gate_m):
-                return (False, float("inf"))
-
-        dx = float(box_tr.cx - box_det.cx)
-        dy = float(box_tr.cy - box_det.cy)
-        dist = float(math.sqrt(dx * dx + dy * dy))
-        if dist > float(cfg.dist_gate_m):
-            return (False, dist)
-        return (True, dist)
-
-    def _build_candidates(
-        self,
-        track_boxes: List[Box3D],
-        det_boxes: List[Box3D],
-        *,
-        track_xy: np.ndarray,
-        det_xy: np.ndarray,
-        track_corners: np.ndarray,
-        track_areas: np.ndarray,
-        det_corners: np.ndarray,
-        det_areas: np.ndarray,
-    ) -> List[Tuple[int, int, float, float]]:
-        """
-        Build sparse candidate edges (ti, dj, iou, dist) using radius query and optional top-k pruning.
-        """
-        cfg = self.cfg
-        nT = len(track_boxes)
-        nD = len(det_boxes)
-        if nT == 0 or nD == 0:
-            return []
-
-        # Build neighbor structure for detections
-        if cKDTree is not None:
-            tree = cKDTree(det_xy)
-            # Query within dist_gate
-            neigh = tree.query_ball_point(track_xy, r=float(cfg.dist_gate_m))
-        else:
-            # Fallback: brute force
-            neigh = []
-            for i in range(nT):
-                dx = det_xy[:, 0] - track_xy[i, 0]
-                dy = det_xy[:, 1] - track_xy[i, 1]
-                d2 = dx * dx + dy * dy
-                idx = np.where(d2 <= float(cfg.dist_gate_m) ** 2)[0]
-                neigh.append(idx.tolist())
-
-        topk = int(max(1, cfg.assoc_topk))
-        edges: List[Tuple[int, int, float, float]] = []
-
-        for ti in range(nT):
-            cand_js = neigh[ti]
-            if not cand_js:
-                continue
-
-            # If too many candidates, keep closest top-k by distance
-            if len(cand_js) > topk:
-                dxy = det_xy[np.array(cand_js)] - track_xy[ti : ti + 1, :]
-                d2 = np.sum(dxy * dxy, axis=1)
-                keep = np.argpartition(d2, topk)[:topk]
-                cand_js = [cand_js[k] for k in keep.tolist()]
-
-            btr = track_boxes[ti]
-            for dj in cand_js:
-                bdet = det_boxes[dj]
-                ok, dist = self._gate_pair_distance_only(btr, bdet)
-                if not ok:
-                    continue
-                iou = bev_iou_oriented_cached(
-                    track_corners[ti], float(track_areas[ti]),
-                    det_corners[dj], float(det_areas[dj]),
-                )
-                edges.append((ti, dj, float(iou), float(dist)))
-
-        return edges
-
-    # -----------------------------
-    # Component-wise Hungarian assignment
-    # -----------------------------
-
-    def _assign_component_hungarian(
-        self,
-        nT: int,
-        nD: int,
-        edges: List[Tuple[int, int, float, float]],
-    ) -> List[Tuple[int, int]]:
-        """
-        Solve assignment on the sparse graph by connected components.
-        Returns matches as (ti, dj).
-
-        Cost: (1 - iou) * assoc_iou_weight + dist
-        """
-        if nT == 0 or nD == 0 or not edges:
-            return []
-
-        W = float(self.cfg.assoc_iou_weight)
-        big = float(self.cfg.forbidden_cost)
-
-        # Build connected components over bipartite graph
-        uf = _UnionFind(nT + nD)
-        for ti, dj, _, _ in edges:
-            uf.union(ti, nT + dj)
-
-        comp_tracks: Dict[int, Set[int]] = {}
-        comp_dets: Dict[int, Set[int]] = {}
-        comp_edges: Dict[int, List[Tuple[int, int, float, float]]] = {}
-
-        for ti, dj, iou, dist in edges:
-            r = uf.find(ti)
-            comp_tracks.setdefault(r, set()).add(ti)
-            comp_dets.setdefault(r, set()).add(dj)
-            comp_edges.setdefault(r, []).append((ti, dj, iou, dist))
-
-        matches: List[Tuple[int, int]] = []
-
-        for r, e_list in comp_edges.items():
-            Tset = sorted(comp_tracks.get(r, set()))
-            Dset = sorted(comp_dets.get(r, set()))
-            if not Tset or not Dset:
-                continue
-
-            t_index = {ti: k for k, ti in enumerate(Tset)}
-            d_index = {dj: k for k, dj in enumerate(Dset)}
-
-            nt = len(Tset)
-            nd = len(Dset)
-            cost = np.full((nt, nd), big, dtype=np.float64)
-
-            for ti, dj, iou, dist in e_list:
-                ii = t_index[ti]
-                jj = d_index[dj]
-                c = (1.0 - float(iou)) * W + float(dist)
-                # keep best edge if multiple
-                if c < cost[ii, jj]:
-                    cost[ii, jj] = c
-
-            if linear_sum_assignment is None:
-                # Fallback: greedy on cost (still component-local)
-                flat: List[Tuple[float, int, int]] = []
-                for ii in range(nt):
-                    for jj in range(nd):
-                        if cost[ii, jj] < big * 0.5:
-                            flat.append((float(cost[ii, jj]), ii, jj))
-                flat.sort(key=lambda x: x[0])
-                used_i: Set[int] = set()
-                used_j: Set[int] = set()
-                for c, ii, jj in flat:
-                    if ii in used_i or jj in used_j:
-                        continue
-                    used_i.add(ii)
-                    used_j.add(jj)
-                    matches.append((Tset[ii], Dset[jj]))
-                continue
-
-            row_ind, col_ind = linear_sum_assignment(cost)
-            for ii, jj in zip(row_ind.tolist(), col_ind.tolist()):
-                if cost[ii, jj] >= big * 0.5:
-                    continue
-                matches.append((Tset[ii], Dset[jj]))
-
-        return matches
-
-    # -----------------------------
     # Public stepping API
     # -----------------------------
 
@@ -801,17 +456,19 @@ class HeadroomAdapter(TrackerBase):
         gt_xy = np.array([[b.cx, b.cy] for b in gt_boxes], dtype=np.float64) if gt_boxes else np.zeros((0, 2), dtype=np.float64)
         gt_corners, gt_areas = _precompute_bev_rects(gt_boxes)
 
-        gt_edges = self._build_candidates(
-            track_boxes=gt_boxes,
-            det_boxes=det_boxes,
-            track_xy=gt_xy,
+        gt_edges = _build_candidates(
+            cfg,
+            gt_boxes,
+            det_boxes,
+            gt_xy=gt_xy,
             det_xy=det_xy,
-            track_corners=gt_corners,
-            track_areas=gt_areas,
+            gt_corners=gt_corners,
+            gt_areas=gt_areas,
             det_corners=det_corners,
             det_areas=det_areas,
+            min_iou=0.0,  # IMPORTANT: tracker should not prune by IoU
         )
-        gt_matches_local = self._assign_component_hungarian(len(gt_boxes), len(det_boxes), gt_edges)
+        gt_matches_local = _assign_component_hungarian(cfg, len(gt_boxes), len(det_boxes), gt_edges)
 
         # Translate to (gt_id, det_global_index)
         gt_matches: Dict[int, int] = {}  # gt_id -> det_idx_in_det_list
@@ -823,7 +480,6 @@ class HeadroomAdapter(TrackerBase):
             used_det_local.add(dj)
 
         # ---- Update GT tracks evidence + observation ----
-        gt_matched_ids: Set[int] = set(gt_matches.keys())
         for gid in gt_ids:
             tr = self._gt_tracks[gid]
             if gid in gt_matches:
@@ -860,9 +516,7 @@ class HeadroomAdapter(TrackerBase):
                 self._gt_tracks[gid] = tr
 
         # ---- 2) FP association on remaining detections ----
-        remaining_det_indices: List[int] = []
         remaining_det_boxes: List[Box3D] = []
-        remaining_det_scores: List[Optional[float]] = []
         remaining_det_map: List[int] = []  # local remaining -> global det_list index
 
         for local_j, global_i in enumerate(det_indices):
@@ -872,9 +526,7 @@ class HeadroomAdapter(TrackerBase):
             if d.box is None:
                 continue
             remaining_det_map.append(global_i)
-            remaining_det_indices.append(local_j)  # index into det_boxes
             remaining_det_boxes.append(d.box)
-            remaining_det_scores.append(d.score)
 
         # Build remaining arrays
         rem_xy = np.array([[b.cx, b.cy] for b in remaining_det_boxes], dtype=np.float64) if remaining_det_boxes else np.zeros((0, 2), dtype=np.float64)
@@ -885,17 +537,20 @@ class HeadroomAdapter(TrackerBase):
         fp_xy = np.array([[b.cx, b.cy] for b in fp_boxes], dtype=np.float64) if fp_boxes else np.zeros((0, 2), dtype=np.float64)
         fp_corners, fp_areas = _precompute_bev_rects(fp_boxes)
 
-        fp_edges = self._build_candidates(
-            track_boxes=fp_boxes,
-            det_boxes=remaining_det_boxes,
-            track_xy=fp_xy,
+        fp_edges = _build_candidates(
+            cfg,
+            fp_boxes,
+            remaining_det_boxes,
+            gt_xy=fp_xy,
             det_xy=rem_xy,
-            track_corners=fp_corners,
-            track_areas=fp_areas,
+            gt_corners=fp_corners,
+            gt_areas=fp_areas,
             det_corners=rem_corners,
             det_areas=rem_areas,
+            min_iou=0.0,  # IMPORTANT: tracker should not prune by IoU
         )
-        fp_matches_local = self._assign_component_hungarian(len(fp_boxes), len(remaining_det_boxes), fp_edges)
+        fp_matches_local = _assign_component_hungarian(cfg, len(fp_boxes), len(remaining_det_boxes), fp_edges)
+
 
         fp_matched_tids: Set[int] = set()
         fp_used_det_locals: Set[int] = set()

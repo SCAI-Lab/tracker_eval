@@ -9,13 +9,27 @@ from tracker_eval.cli.run_tracker import main as run_one_tracker_main
 
 
 TRACKER_ORDER = [
-    "elptnet",
-    "cbmot",
-    "fastpoly",
-    "ab3dmot",
-    "gnnpmb",
-    "simpletrack",
+    "headroom",
+    # "elptnet",
+    # "cbmot",
+    # "fastpoly",
+    # "ab3dmot",
+    # "gnnpmb",
+    # "simpletrack",
 ]
+
+# Optional baked-in default per-tracker workers (only used if you want it).
+# Leave as None to not use baked-in defaults.
+# Example:
+DEFAULT_WORKERS_PER_TRACKER = {
+    "headroom": 8,
+    # "elptnet": 8,
+    # "cbmot": 8,
+    # "fastpoly": 2,
+    # "ab3dmot": 2,
+    # "gnnpmb": 2,
+}
+# DEFAULT_WORKERS_PER_TRACKER = None
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -43,6 +57,12 @@ def build_argparser() -> argparse.ArgumentParser:
     # Shared IO
     p.add_argument("--out_root", type=str, required=True)
     p.add_argument("--detections_subdir", type=str, default="detections_3D")
+    p.add_argument(
+        "--labels_subdir",
+        type=str,
+        default="labels_3d",
+        help="GT labels subfolder name under split_root (default: labels_3d). Used by headroom.",
+    )
 
     # Shared runtime/output behavior
     p.add_argument("--warmup_steps", type=int, default=0)
@@ -55,37 +75,40 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--no_kitti_score", action="store_true")
     p.add_argument("--quiet", action="store_true")
 
-    # Tracker-specific paths / params (same as your current usage)
-    p.add_argument("--elptnet_cfg_file", type=str, default="/home/scai/trackers/ELPTNet/jrdb.yaml")
-    p.add_argument("--elptnet_track_class", type=str, default="pedestrian")
-    p.add_argument("--elptnet_fps", type=float, default=15.0)
-
-    p.add_argument("--fastpoly_config", type=str, default="/home/scai/trackers/FastPoly/config/nusc_config.yaml")
-
+    # Parallel options (forwarded to run_tracker)
     p.add_argument(
-        "--ab3dmot_log_dir",
-        type=str,
+        "--parallel",
+        action="store_true",
+        help="Run sequences in parallel using multiple processes (one tracker instance per sequence). "
+             "In parallel mode, timing/per-frame profiling is disabled.",
+    )
+    p.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="Number of worker processes for --parallel, applied to ALL trackers unless overridden. "
+             "0 means auto (cpu_count).",
+    )
+    p.add_argument(
+        "--num_workers_per_tracker",
+        type=int,
+        nargs="*",
         default=None,
-        help="If set, AB3DMOT logs go here; otherwise AB3DMOT adapter default.",
+        help=(
+            "Optional per-tracker worker counts for --parallel. "
+            "If provided with length 1, it is broadcast to all trackers. "
+            "If provided with length equal to the number of trackers being run (after --only filtering), "
+            "it is used as (headroom, elptnet, cbmot, fastpoly, ab3dmot, gnnpmb) in the run order. "
+            "Example: --num_workers_per_tracker 2 8 8 4 8 2"
+        ),
     )
-
     p.add_argument(
-        "--gnnpmb_parameters_path",
+        "--parallel_start_method",
         type=str,
-        default="/home/scai/trackers/GnnPmbTracker/configs/gnnpmb_parameters.json",
+        default="spawn",
+        choices=["spawn", "fork", "forkserver"],
+        help="Multiprocessing start method for --parallel (default: spawn).",
     )
-    p.add_argument("--gnnpmb_classification", type=str, default="pedestrian")
-    p.add_argument("--gnnpmb_fps", type=float, default=15.0)
-
-    p.add_argument(
-        "--simpletrack_config",
-        type=str,
-        default="/home/scai/trackers/SimpleTrack/configs/nu_configs/giou.yaml",
-    )
-
-    # CBMOT core ones you’ve been using
-    p.add_argument("--cbmot_track_class", type=str, default="pedestrian")
-    p.add_argument("--cbmot_fps", type=float, default=15.0)
 
     # Control
     p.add_argument(
@@ -93,7 +116,45 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         nargs="*",
         default=None,
-        help="Optional subset of trackers to run (names: elptnet, cbmot, fastpoly, ab3dmot, gnnpmb, simpletrack).",
+        help="Optional subset of trackers to run (names: elptnet, cbmot, fastpoly, ab3dmot, gnnpmb, simpletrack, headroom).",
+    )
+
+    # Pseudo-detector variants (optional)
+    p.add_argument(
+        "--variants",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Detection variants to run. Example: --variants clean dropout_L1 combo_A. "
+            "If omitted, runs only the base detections_subdir."
+        ),
+    )
+    p.add_argument(
+        "--variants_subdir",
+        type=str,
+        default=None,
+        help=(
+            "Parent folder that contains per-variant detection folders. "
+            "Example: detections_3D_pseudo. "
+            "If set and --variants is used, detections_subdir becomes <variants_subdir>/<variant>."
+        ),
+    )
+    p.add_argument(
+        "--variants_from_manifest",
+        type=str,
+        default=None,
+        help=(
+            "Path to a manifest.json produced by generate_pseudo_detections_from_gt.py. "
+            "If set and --variants is omitted, variants are taken from manifest (includes 'clean')."
+        ),
+    )
+    p.add_argument(
+        "--exclude_variants",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional variants to skip (works with --variants or --variants_from_manifest).",
     )
 
     return p
@@ -106,6 +167,7 @@ def _append_shared(args: argparse.Namespace, argv: List[str]) -> List[str]:
 
     argv += ["--out_root", args.out_root]
     argv += ["--detections_subdir", args.detections_subdir]
+    argv += ["--labels_subdir", args.labels_subdir]
 
     argv += ["--warmup_steps", str(args.warmup_steps)]
     if args.limit_sequences is not None:
@@ -125,7 +187,55 @@ def _append_shared(args: argparse.Namespace, argv: List[str]) -> List[str]:
         argv += ["--no_kitti_score"]
     if args.quiet:
         argv += ["--quiet"]
+
+    if args.variants is not None and len(args.variants) > 0:
+        argv += ["--variants", *args.variants]
+    if args.exclude_variants is not None and len(args.exclude_variants) > 0:
+        argv += ["--exclude_variants", *args.exclude_variants]
+    if args.variants_subdir is not None:
+        argv += ["--variants_subdir", args.variants_subdir]
+    if args.variants_from_manifest is not None:
+        argv += ["--variants_from_manifest", args.variants_from_manifest]
+
     return argv
+
+
+def _resolve_workers_for_trackers(
+    trackers: List[str],
+    *,
+    parallel: bool,
+    num_workers: int,
+    num_workers_per_tracker: Optional[List[int]],
+) -> List[int]:
+    """
+    Returns a list of workers aligned with `trackers`.
+    Priority:
+      1) --num_workers_per_tracker (len 1 broadcast OR exact length match)
+      2) DEFAULT_WORKERS_PER_TRACKER mapping (if provided)
+      3) --num_workers (single value for all)
+    If not parallel, returns zeros.
+    """
+    if not parallel:
+        return [0] * len(trackers)
+
+    if num_workers_per_tracker is not None and len(num_workers_per_tracker) > 0:
+        xs = [int(x) for x in num_workers_per_tracker]
+        if len(xs) == 1:
+            return [xs[0]] * len(trackers)
+        if len(xs) == len(trackers):
+            return xs
+        raise ValueError(
+            f"--num_workers_per_tracker length must be 1 or equal to number of trackers being run "
+            f"({len(trackers)}). Got {len(xs)}."
+        )
+
+    if DEFAULT_WORKERS_PER_TRACKER is not None:
+        out = []
+        for t in trackers:
+            out.append(int(DEFAULT_WORKERS_PER_TRACKER.get(t, num_workers)))
+        return out
+
+    return [int(num_workers)] * len(trackers)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -134,11 +244,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     only = set([t.strip() for t in (args.only or []) if t.strip()]) or None
     trackers = [t for t in TRACKER_ORDER if (only is None or t in only)]
 
+    workers_list = _resolve_workers_for_trackers(
+        trackers,
+        parallel=bool(args.parallel),
+        num_workers=int(args.num_workers),
+        num_workers_per_tracker=args.num_workers_per_tracker,
+    )
+
     if not args.quiet:
         print("[tracker_eval] Will run trackers in order:", ", ".join(trackers))
         print("[tracker_eval] Splits:", ", ".join(args.split_root))
 
-    for t in trackers:
+        if args.parallel:
+            parts = [f"{t}:{w if w != 0 else 'auto'}" for t, w in zip(trackers, workers_list)]
+            print(f"[tracker_eval] Parallel mode ON | start_method={args.parallel_start_method}")
+            print("[tracker_eval] Workers per tracker:", ", ".join(parts))
+
+    for t, w in zip(trackers, workers_list):
         if not args.quiet:
             print("")
             print("=" * 80)
@@ -149,30 +271,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         cmd = _append_shared(args, cmd)
         cmd += ["--tracker", t]
 
-        # tracker-specific forwarding
-        if t == "elptnet":
-            cmd += ["--elptnet_cfg_file", args.elptnet_cfg_file]
-            cmd += ["--elptnet_track_class", args.elptnet_track_class]
-            cmd += ["--elptnet_fps", str(args.elptnet_fps)]
-        elif t == "cbmot":
-            cmd += ["--cbmot_track_class", args.cbmot_track_class]
-            cmd += ["--cbmot_fps", str(args.cbmot_fps)]
-            # You can add more CBMOT knobs here later if you want.
-        elif t == "fastpoly":
-            cmd += ["--fastpoly_config", args.fastpoly_config]
-        elif t == "ab3dmot":
-            if args.ab3dmot_log_dir is not None:
-                cmd += ["--ab3dmot_log_dir", args.ab3dmot_log_dir]
-        elif t == "gnnpmb":
-            cmd += ["--gnnpmb_parameters_path", args.gnnpmb_parameters_path]
-            cmd += ["--gnnpmb_classification", args.gnnpmb_classification]
-            cmd += ["--gnnpmb_fps", str(args.gnnpmb_fps)]
-        elif t == "simpletrack":
-            cmd += ["--simpletrack_config", args.simpletrack_config]
-        else:
-            raise ValueError(f"Unhandled tracker in run_all_trackers: {t}")
+        # Forward parallel flags with per-tracker worker count
+        if args.parallel:
+            cmd += ["--parallel"]
+            cmd += ["--num_workers", str(int(w))]
+            cmd += ["--parallel_start_method", str(args.parallel_start_method)]
 
-        # Run by calling the same python entry logic (no subprocess needed)
         rc = run_one_tracker_main(cmd)
         if rc != 0:
             raise SystemExit(rc)

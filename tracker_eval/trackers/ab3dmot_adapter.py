@@ -19,8 +19,8 @@ class AB3DMOTConfig:
 
     These defaults match common AB3DMOT usage, but you should tune for JRDB.
     """
-    max_age: int = 7
-    min_hits: int = 5
+    max_age: int = 15
+    min_hits: int = 3
     thresh_3d_iou: float = 0.33
     thresh_3d_dist: float = 0.5
     metrics: Tuple[str, str] = ("iou_3d", "dist_3d")

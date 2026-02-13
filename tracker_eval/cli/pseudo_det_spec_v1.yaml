@@ -1,0 +1,196 @@
+# Pseudo-detector spec for GT->detections corruption variants.
+# YAML allows comments; your generator will expand:
+#  - a "clean" variant (unless excluded)
+#  - single_mode_sweeps: per-mode levels (e.g., dropout_L1)
+#  - combos: merged variants using chosen levels
+
+base:
+  fps: 15                 # Used to convert seconds -> frames for burst durations
+  class_name: pedestrian  # Only this GT class is converted to pseudo detections
+  severity: 1.0           # Global multiplier applied to probabilities + noise magnitudes (1.0 = as written)
+  score_value: 1.0        # Constant confidence score written for every emitted detection (you set scores fixed)
+
+  # Optional / supported by generator (per-variant overrides also allowed):
+  # severity: 0.8          # If you want all noise/probabilities scaled down
+
+single_mode_sweeps:
+
+  dropout:
+    # FN bursts: remove detections for a target for a contiguous gap.
+    # Stresses: occlusion handling, track lifecycle logic, re-identification / re-association after gaps.
+    - name: L1
+      dropout_enable: true        # Enable dropout mode
+      dropout_p_start: 0.005      # Per-frame probability to START a dropout burst (per GT track)
+      dropout_min_s: 0.0667       # Min burst duration in seconds (ceil to >=1 frame)
+      dropout_max_s: 0.25         # Max burst duration in seconds
+
+    - name: L2
+      dropout_enable: true
+      dropout_p_start: 0.010
+      dropout_min_s: 0.0667
+      dropout_max_s: 0.50
+
+    - name: L3
+      dropout_enable: true
+      dropout_p_start: 0.020
+      dropout_min_s: 0.0667
+      dropout_max_s: 1.00
+
+
+  instability:
+    # Temporal instability: detection "winner" switches between K plausible hypotheses/modes.
+    # Stresses: association robustness under jitter + yaw flips + size jitter and temporal inconsistency.
+    #
+    # Conceptually:
+    #  - Each track has K modes with fixed biases (xy/yaw/lwh)
+    #  - Each frame, with probability p_switch, switch to another mode
+    #  - Add per-frame jitter around current mode
+    #  - With probability p_yaw_random, set yaw to Uniform(-pi, pi)
+    - name: L1
+      instability_enable: true
+      instability_k_modes: 3                 # Number of latent hypotheses (modes) that can win over time
+      instability_p_switch: 0.05             # Per-frame probability of switching to a different mode
+
+      instability_mode_xy_sigma_m: 0.03      # Std dev of each mode's XY bias (meters) relative to GT
+      instability_jitter_xy_sigma_m: 0.01    # Per-frame XY jitter around current mode (meters)
+
+      instability_mode_yaw_sigma_rad: 0.8    # Std dev of each mode's yaw bias (radians) relative to GT yaw
+      instability_jitter_yaw_sigma_rad: 0.15 # Per-frame yaw jitter around current mode (radians)
+
+      instability_p_yaw_random: 0.05         # Per-frame prob: override yaw with Uniform(-pi, pi)
+
+      instability_mode_lwh_sigma_rel: 0.03   # Relative (multiplicative) std for mode size bias
+      instability_jitter_lwh_sigma_rel: 0.01 # Relative std for per-frame size jitter
+
+    - name: L2
+      instability_enable: true
+      instability_k_modes: 3
+      instability_p_switch: 0.15
+
+      instability_mode_xy_sigma_m: 0.06
+      instability_jitter_xy_sigma_m: 0.02
+
+      instability_mode_yaw_sigma_rad: 1.3
+      instability_jitter_yaw_sigma_rad: 0.25
+
+      instability_p_yaw_random: 0.15
+
+      instability_mode_lwh_sigma_rel: 0.05
+      instability_jitter_lwh_sigma_rel: 0.02
+
+    - name: L3
+      instability_enable: true
+      instability_k_modes: 3
+      instability_p_switch: 0.30
+
+      instability_mode_xy_sigma_m: 0.10
+      instability_jitter_xy_sigma_m: 0.03
+
+      instability_mode_yaw_sigma_rad: 1.8
+      instability_jitter_yaw_sigma_rad: 0.40
+
+      instability_p_yaw_random: 0.30
+
+      instability_mode_lwh_sigma_rel: 0.08
+      instability_jitter_lwh_sigma_rel: 0.03
+
+    # Optional / supported by generator:
+    # - you can override severity per-variant by adding: severity: 0.9
+
+
+  confusers:
+    # Confuser FP tracklets: add extra false-positive trajectories near each GT target.
+    # Stresses: data association confusion, ID switches, track fragmentation, false track initiation.
+    #
+    # Conceptually:
+    #  - For a GT track, start a confuser tracklet with probability p_start
+    #  - Confuser persists for [min_s, max_s]
+    #  - Confuser boxes are offset from GT by a random direction and magnitude ~ N(mu, sigma)
+    #  - Confuser has its own yaw/size bias + per-frame jitter
+    #  - confuser_max_active bounds number of simultaneously active confusers per GT
+    #  - confuser_only_when_primary_present controls whether confusers are emitted only when the main detection exists
+    - name: L1
+      confuser_enable: true
+      confuser_p_start: 0.003
+      confuser_min_s: 0.20
+      confuser_max_s: 0.60
+      confuser_max_active: 1
+
+      confuser_offset_xy_mu_m: 0.25
+      confuser_offset_xy_sigma_m: 0.08
+
+      confuser_yaw_sigma_rad: 1.0
+      confuser_lwh_sigma_rel: 0.03
+
+      confuser_jitter_xy_sigma_m: 0.02
+      confuser_jitter_yaw_sigma_rad: 0.15
+      confuser_jitter_lwh_sigma_rel: 0.01
+
+      confuser_p_yaw_random: 0.05
+      confuser_only_when_primary_present: true
+
+    - name: L2
+      confuser_enable: true
+      confuser_p_start: 0.008
+      confuser_min_s: 0.20
+      confuser_max_s: 1.00
+      confuser_max_active: 1
+
+      confuser_offset_xy_mu_m: 0.30
+      confuser_offset_xy_sigma_m: 0.10
+
+      confuser_yaw_sigma_rad: 1.5
+      confuser_lwh_sigma_rel: 0.05
+
+      confuser_jitter_xy_sigma_m: 0.03
+      confuser_jitter_yaw_sigma_rad: 0.25
+      confuser_jitter_lwh_sigma_rel: 0.02
+
+      confuser_p_yaw_random: 0.15
+      confuser_only_when_primary_present: true
+
+    - name: L3
+      confuser_enable: true
+      confuser_p_start: 0.015
+      confuser_min_s: 0.20
+      confuser_max_s: 1.50
+      confuser_max_active: 2
+
+      confuser_offset_xy_mu_m: 0.35
+      confuser_offset_xy_sigma_m: 0.12
+
+      confuser_yaw_sigma_rad: 2.0
+      confuser_lwh_sigma_rel: 0.08
+
+      confuser_jitter_xy_sigma_m: 0.04
+      confuser_jitter_yaw_sigma_rad: 0.35
+      confuser_jitter_lwh_sigma_rel: 0.03
+
+      confuser_p_yaw_random: 0.30
+      confuser_only_when_primary_present: true
+
+    # Optional / supported by generator:
+    # confuser_only_when_primary_present: false  # Allow confusers even when primary detection is dropped (harsher)
+
+
+combos:
+  # Combos merge the referenced sweep levels (by name) into one variant.
+  # If the generator supports "overrides", you can add extra fields to tweak combos.
+  - name: combo_A
+    use:
+      instability: L2
+      dropout: L2
+      confusers: L1
+    # overrides: {}   # Optional: extra per-combo overrides (if implemented)
+
+  - name: combo_B
+    use:
+      instability: L3
+      dropout: L2
+      confusers: L2
+
+  - name: combo_C
+    use:
+      instability: L2
+      dropout: L3
+      confusers: L2

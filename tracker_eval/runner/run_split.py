@@ -5,17 +5,17 @@ from __future__ import annotations
 import csv
 import json
 import os
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 
-from tracker_eval.common.types import frame_sort_key
 from tracker_eval.data.jrdb_io import (
     list_sequence_jsons,
     sequence_name_from_json_filename,
-    load_jrdb_labels_3d,   # <-- add
+    load_jrdb_labels_3d,
 )
 
 from tracker_eval.runner.run_sequence import (
@@ -40,9 +40,9 @@ class SplitRunSummary:
     num_sequences: int
     num_frames_total: int
     warmup_steps: int
-    sequences: List[Dict[str, Any]]          # list of SequenceRunStats dicts (+ paths)
-    aggregate: Dict[str, Any]               # aggregate runtime stats
-    io: Dict[str, Any]                      # important paths used
+    sequences: List[Dict[str, Any]]
+    aggregate: Dict[str, Any]
+    io: Dict[str, Any]
 
 
 # ----------------------------
@@ -65,16 +65,8 @@ def _aggregate_sequence_stats(stats: Sequence[SequenceRunStats]) -> Dict[str, An
     """
     Aggregates per-sequence runtime stats into overall metrics.
 
-    Provides both:
-      - simple mean/median over sequences
-      - frame-weighted FPS (based on frames and mean step times)
-      - pooled latency percentiles (approx) by concatenating per-frame latencies not available here,
-        so we approximate using per-seq pXX and means (we report sequence-level percentiles instead).
-
-    Note: We only have per-sequence percentiles (p50/p90/p99), not per-frame samples.
-    So we report:
-      - distribution of per-seq p50/p90/p99
-      - distribution of per-seq mean_step_ms
+    In parallel mode we append "dummy" stats with timings set to 0 but num_frames populated,
+    so counts are correct but timing fields stay 0.
     """
     if not stats:
         return {
@@ -105,10 +97,6 @@ def _aggregate_sequence_stats(stats: Sequence[SequenceRunStats]) -> Dict[str, An
     p99_list = [float(s.p99_step_ms) for s in stats]
     frames_list = [int(s.num_frames) for s in stats]
 
-    # Frame-weighted FPS:
-    # We approximate total effective time by summing (num_frames * mean_step_ms).
-    # This slightly differs from per-sequence warmup exclusions and internal effective_time_s,
-    # but is stable and comparable as a split-level summary.
     total_frames = int(sum(frames_list))
     total_time_s_approx = float(sum((f * ms) for f, ms in zip(frames_list, mean_ms_list)) / 1000.0)
     fps_weighted = float(total_frames / total_time_s_approx) if total_time_s_approx > 0 else 0.0
@@ -117,20 +105,20 @@ def _aggregate_sequence_stats(stats: Sequence[SequenceRunStats]) -> Dict[str, An
         "num_sequences": int(len(stats)),
         "num_frames_total": total_frames,
         "fps": {
-            "mean_over_sequences": float(np.mean(fps_list)),
-            "median_over_sequences": float(np.median(fps_list)),
-            "min_over_sequences": float(np.min(fps_list)),
-            "max_over_sequences": float(np.max(fps_list)),
+            "mean_over_sequences": float(np.mean(fps_list)) if fps_list else 0.0,
+            "median_over_sequences": float(np.median(fps_list)) if fps_list else 0.0,
+            "min_over_sequences": float(np.min(fps_list)) if fps_list else 0.0,
+            "max_over_sequences": float(np.max(fps_list)) if fps_list else 0.0,
             "frame_weighted": fps_weighted,
         },
         "step_ms": {
-            "mean_of_mean": float(np.mean(mean_ms_list)),
-            "median_of_mean": float(np.median(mean_ms_list)),
+            "mean_of_mean": float(np.mean(mean_ms_list)) if mean_ms_list else 0.0,
+            "median_of_mean": float(np.median(mean_ms_list)) if mean_ms_list else 0.0,
             "p90_of_mean": _percentile(mean_ms_list, 90),
             "p99_of_mean": _percentile(mean_ms_list, 99),
-            "mean_of_p50": float(np.mean(p50_list)),
-            "mean_of_p90": float(np.mean(p90_list)),
-            "mean_of_p99": float(np.mean(p99_list)),
+            "mean_of_p50": float(np.mean(p50_list)) if p50_list else 0.0,
+            "mean_of_p90": float(np.mean(p90_list)) if p90_list else 0.0,
+            "mean_of_p99": float(np.mean(p99_list)) if p99_list else 0.0,
         },
     }
     return agg
@@ -154,6 +142,219 @@ def _write_csv(path: Union[str, Path], rows: List[Dict[str, Any]], fieldnames: L
 
 
 # ----------------------------
+# Parallel: tracker construction
+# ----------------------------
+
+def _build_tracker_from_spec(spec: Dict[str, Any]) -> Tracker3D:
+    """
+    Construct a fresh tracker instance from a picklable spec (created by CLI).
+    This runs inside worker processes in parallel mode.
+    """
+    tracker_key = str(spec.get("tracker", "")).strip()
+    cfg = spec.get("cfg", {}) or {}
+
+    if tracker_key == "ab3dmot":
+        from tracker_eval.trackers.ab3dmot_adapter import AB3DMOTAdapter, AB3DMOTConfig
+        metrics = tuple(cfg.get("metrics", ["iou_3d", "dist_3d"]))
+        tcfg = AB3DMOTConfig(
+            max_age=int(cfg.get("max_age", 15)),
+            min_hits=int(cfg.get("min_hits", 3)),
+            thresh_3d_iou=float(cfg.get("thresh_3d_iou", 0.33)),
+            thresh_3d_dist=float(cfg.get("thresh_3d_dist", 0.5)),
+            metrics=metrics,  # type: ignore[arg-type]
+            log_dir=cfg.get("log_dir", None),
+        )
+        return AB3DMOTAdapter(cfg=tcfg)
+
+    if tracker_key == "simpletrack":
+        from tracker_eval.trackers.simpletrack_adapter import SimpleTrackAdapter, SimpleTrackConfig
+        tcfg = SimpleTrackConfig(config_path=str(cfg.get("config_path")))
+        return SimpleTrackAdapter(cfg=tcfg)
+
+    if tracker_key == "fastpoly":
+        from tracker_eval.trackers.fastpoly_adapter import FastPolyAdapter, FastPolyConfig
+        tcfg = FastPolyConfig(
+            config=cfg.get("config", {}),
+            seq_id=int(cfg.get("seq_id", 0)),
+            has_velo=bool(cfg.get("has_velo", False)),
+            is_key_frame=bool(cfg.get("is_key_frame", True)),
+            force_class_label=cfg.get("force_class_label", None),
+            use_numeric_frame_id=bool(cfg.get("use_numeric_frame_id", True)),
+        )
+        return FastPolyAdapter(cfg=tcfg)
+
+    if tracker_key == "gnnpmb":
+        from tracker_eval.trackers.gnnpmbtracker_adapter import GNNPMBAdapter, GNNPMBConfig
+        tcfg = GNNPMBConfig(
+            parameters_path=str(cfg.get("parameters_path")),
+            classification=str(cfg.get("classification", "pedestrian")),
+            use_nms=bool(cfg.get("use_nms", True)),
+            fps=float(cfg.get("fps", 15.0)),
+            giou_gating=float(cfg.get("giou_gating", -0.5)),
+            ped_empty_meas_extract_thr=float(cfg.get("ped_empty_meas_extract_thr", 0.7)),
+        )
+        return GNNPMBAdapter(cfg=tcfg)
+
+    if tracker_key == "cbmot":
+        from tracker_eval.trackers.cbmot_adapter import CBMOTAdapter, CBMOTConfig
+        tcfg = CBMOTConfig(
+            hungarian=bool(cfg.get("hungarian", False)),
+            max_age=int(cfg.get("max_age", 15)),
+            min_hits=int(cfg.get("min_hits", 2)),
+            score_decay=float(cfg.get("score_decay", 0.2)),
+            active_th=float(cfg.get("active_th", 1.0)),
+            deletion_th=float(cfg.get("deletion_th", 0.0)),
+            detection_th=float(cfg.get("detection_th", 0.5)),
+            score_update=cfg.get("score_update", None),
+            model_path=cfg.get("model_path", None),
+            fps=float(cfg.get("fps", 15.0)),
+            track_class=cfg.get("track_class", "pedestrian"),
+            export_score=bool(cfg.get("export_score", False)),
+        )
+        return CBMOTAdapter(cfg=tcfg)
+
+    if tracker_key == "elptnet":
+        from tracker_eval.trackers.elptnet_adapter import ELPTnetAdapter, ELPTnetConfig
+        tcfg = ELPTnetConfig(
+            cfg_file=str(cfg.get("cfg_file")),
+            fps=float(cfg.get("fps", 15.0)),
+            track_class=str(cfg.get("track_class", "pedestrian")),
+            input_score=float(cfg.get("input_score", 0.5)),
+            export_score=bool(cfg.get("export_score", False)),
+            timestamp_mode=str(cfg.get("timestamp_mode", "frame_index")),
+        )
+        return ELPTnetAdapter(cfg=tcfg)
+
+    if tracker_key == "headroom":
+        from tracker_eval.trackers.headroom_adapter import HeadroomAdapter, HeadroomConfig
+        tcfg = HeadroomConfig(
+            fps=float(cfg.get("fps", 15.0)),
+
+            T_reid_base_s=float(cfg.get("T_reid_base_s", 1.0)),
+            T_reid_static_s=float(cfg.get("T_reid_static_s", 2.0)),
+
+            score_floor=float(cfg.get("score_floor", 0.5)),
+            score_power=float(cfg.get("score_power", 1.5)),
+            tau_hit_s=float(cfg.get("tau_hit_s", 0.10)),
+            tau_miss_s=float(cfg.get("tau_miss_s", 2.0)),
+            theta_on=float(cfg.get("theta_on", 0.50)),
+            min_hits=int(cfg.get("min_hits", 2)),
+
+            T_out_min_s=float(cfg.get("T_out_min_s", 0.30)),
+            T_out_max_s=float(cfg.get("T_out_max_s", 1.0)),
+            T_out_gamma=float(cfg.get("T_out_gamma", 1.0)),
+
+            dist_gate_m=float(cfg.get("dist_gate_m", 0.45)),
+            z_gate_m=float(cfg.get("z_gate_m", 1.0)),
+            assoc_topk=int(cfg.get("assoc_topk", 10)),
+            assoc_iou_weight=float(cfg.get("assoc_iou_weight", 5.0)),
+
+            v_static_thr_mps=float(cfg.get("v_static_thr_mps", 0.20)),
+            jitter_thr_m=float(cfg.get("jitter_thr_m", 0.15)),
+            static_window=int(cfg.get("static_window", 15)),
+
+            gt_stride=int(cfg.get("gt_stride", 100000)),
+            fp_offset=int(cfg.get("fp_offset", 10000000)),
+        )
+        return HeadroomAdapter(cfg=tcfg)
+
+    raise ValueError(f"Unknown tracker in spec: {tracker_key}")
+
+
+def _run_one_sequence_worker(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Worker entry (must be top-level for multiprocessing pickling).
+
+    In parallel mode:
+      - NO profiling/timing
+      - NO per-frame stats files
+      - we still return correct num_frames for aggregate counts.
+    """
+    seq_name = str(job["seq_name"])
+    det_json_path = str(job["det_json_path"])
+    out_kitti_txt = str(job["out_kitti_txt"]) if job.get("out_kitti_txt") else ""
+    kitti_use_score = bool(job.get("kitti_use_score", True))
+    warmup_steps = int(job.get("warmup_steps", 0))
+    tracker_spec = job["tracker_spec"]
+    split_name = str(job.get("split_name", ""))
+    tracker_name = str(job.get("tracker_name", ""))
+
+    labels_subdir = str(job.get("labels_subdir", "labels_3d"))
+    split_root = str(job.get("split_root", ""))
+
+    try:
+        # Build tracker instance inside this process
+        tracker = _build_tracker_from_spec(tracker_spec)
+
+        # Load GT if requested/available and tracker supports it
+        gt_by_frame = None
+        gt_json_path = ""
+        if bool(job.get("use_gt_if_available", True)) and hasattr(tracker, "step_with_gt"):
+            gt_json_path = str(Path(split_root) / labels_subdir / f"{seq_name}.json")
+            if Path(gt_json_path).exists():
+                gt_by_frame = load_jrdb_labels_3d(gt_json_path)
+
+        # Run sequence (profiling disabled)
+        tracks_by_frame, stats, _frame_stats = run_tracker_from_detections_json(
+            seq_name=seq_name,
+            detections_json_path=det_json_path,
+            tracker=tracker,
+            warmup_steps=warmup_steps,
+            gt_by_frame=gt_by_frame,
+            timestamps_by_frame=None,
+            profile=False,
+        )
+
+        # IMPORTANT: provide correct num_frames for aggregate counts in parent
+        num_frames = int(getattr(stats, "num_frames", 0))
+
+        meta = {
+            "split": split_name,
+            "seq_name": seq_name,
+            "tracker_name": tracker_name,
+            "warmup_steps": int(warmup_steps),
+            "detections_json": str(det_json_path),
+            "gt_json": str(gt_json_path) if gt_by_frame is not None else "",
+        }
+
+        write_sequence_outputs(
+            seq_name=seq_name,
+            tracks_by_frame=tracks_by_frame,
+            out_kitti_txt=out_kitti_txt if out_kitti_txt else None,
+            kitti_use_score=kitti_use_score,
+        )
+
+        row = stats.as_dict()
+        row.update(
+            {
+                "status": "ok",
+                "num_frames": num_frames,  # ensure present (even if stats.as_dict already includes it)
+                "detections_json": str(det_json_path),
+                "out_kitti_txt": out_kitti_txt,
+                "frame_stats_csv": "",
+            }
+        )
+        return row
+
+    except Exception as e:
+        return {
+            "seq_name": seq_name,
+            "status": "error",
+            "error": repr(e),
+            "detections_json": str(det_json_path),
+            "out_kitti_txt": out_kitti_txt,
+            "frame_stats_csv": "",
+            "num_frames": 0,
+            "fps": 0.0,
+            "mean_step_ms": 0.0,
+            "p50_step_ms": 0.0,
+            "p90_step_ms": 0.0,
+            "p99_step_ms": 0.0,
+            "total_time_s": 0.0,
+        }
+
+
+# ----------------------------
 # Public API
 # ----------------------------
 
@@ -161,7 +362,12 @@ def run_tracker_on_split(
     *,
     split_root: Union[str, Path],
     split_name: str,
-    tracker: Tracker3D,
+
+    # Sequential mode: pass tracker instance
+    tracker: Optional[Tracker3D],
+    # Parallel mode: pass tracker spec
+    tracker_spec: Optional[Dict[str, Any]] = None,
+
     tracker_name: str,
     out_root: Union[str, Path],
     detections_subdir: str = "detections_3D",
@@ -174,52 +380,25 @@ def run_tracker_on_split(
     include_sequences: Optional[Sequence[str]] = None,
     exclude_sequences: Optional[Sequence[str]] = None,
     sort_sequences: bool = True,
+
     # Output options
     write_kitti_txt: bool = True,
-    write_tracks_json: bool = False,
     kitti_use_score: bool = True,
     tracker_subfolder: str = "data",
     skip_existing_kitti: bool = True,
+
     # Logging
     verbose: bool = True,
+
+    # Parallel options
+    parallel: bool = False,
+    num_workers: int = 0,
+    parallel_start_method: str = "spawn",
 ) -> SplitRunSummary:
     """
-    Run a tracker over all sequences in a split (e.g., JRDB_track/test or JRDB_track/train_val),
-    using precomputed detections JSON files. Measures runtime stats and writes outputs.
-
-    Output layout (JRDB toolkit compatible):
-      <out_root>/<tracker_name>/<tracker_subfolder>/<seq>.txt
-
-    Additionally writes:
-      <out_root>/<tracker_name>/runtime_summary.json
-      <out_root>/<tracker_name>/runtime_summary.csv
-
-    Parameters
-    ----------
-    split_root:
-        Path to split folder (e.g., /mnt/nvme/JRDB_track/test).
-    split_name:
-        Name used in summary (e.g., "test", "train_val").
-    tracker:
-        Tracker instance implementing Tracker3D (AB3DMOT adapter will plug in here).
-    tracker_name:
-        Used for output folder naming.
-    out_root:
-        Root output folder.
-    detections_subdir:
-        Usually "detections_3D" inside split_root.
-    warmup_steps:
-        Steps excluded from timing (per sequence).
-    limit_sequences:
-        If set, only runs the first N sequences after filtering/sorting.
-    include_sequences / exclude_sequences:
-        Optional allow/deny list by sequence name.
-    write_kitti_txt:
-        If True, writes KITTI/JRDB .txt per sequence (recommended).
-    write_tracks_json:
-        If True, writes internal JSON per sequence (debug/transfer).
-    skip_existing_kitti:
-        If True, skip running a sequence if the KITTI output already exists.
+    Sequential mode: original behavior (timing + per-frame stats written).
+    Parallel mode: sequences processed concurrently (one tracker instance per sequence),
+                   timing/per-frame profiling disabled.
     """
     split_root = Path(split_root)
     det_dir = split_root / detections_subdir
@@ -229,11 +408,13 @@ def run_tracker_on_split(
     out_root = Path(out_root)
     tracker_dir = out_root / tracker_name / split_name
     out_kitti_dir = tracker_dir / tracker_subfolder
-    out_json_dir = tracker_dir / "tracks_json"
 
     _safe_mkdir(out_kitti_dir)
-    if write_tracks_json:
-        _safe_mkdir(out_json_dir)
+
+    write_frame_stats = (not parallel)
+    out_frame_stats_dir = tracker_dir / "frame_stats"
+    if write_frame_stats:
+        _safe_mkdir(out_frame_stats_dir)
 
     # Discover sequences from detection JSON files
     det_files = list_sequence_jsons(str(det_dir))
@@ -255,94 +436,226 @@ def run_tracker_on_split(
 
     if verbose:
         print(f"[tracker_eval] Split '{split_name}': {len(seqs)} sequence(s) found in {det_dir}")
+        if parallel:
+            nw = num_workers if num_workers > 0 else (os.cpu_count() or 1)
+            print(f"[tracker_eval] Parallel mode: workers={nw} start_method={parallel_start_method}")
 
     per_seq_rows: List[Dict[str, Any]] = []
     seq_stats: List[SequenceRunStats] = []
 
-    for idx, seq_name in enumerate(seqs):
-        det_json_path = det_dir / f"{seq_name}.json"
-        if not det_json_path.exists():
-            # should not happen because we discovered from dir listing, but keep robust
-            if verbose:
-                print(f"[tracker_eval] WARNING: missing detections file: {det_json_path} (skipping)")
-            continue
+    # ------------------------------------------------------------
+    # Sequential path
+    # ------------------------------------------------------------
+    if not parallel:
+        if tracker is None:
+            raise ValueError("Sequential mode requires a tracker instance (tracker=...).")
 
-        out_kitti_txt = out_kitti_dir / f"{seq_name}.txt"
-        out_tracks_json = out_json_dir / f"{seq_name}.json" if write_tracks_json else None
+        for idx, seq_name in enumerate(seqs):
+            det_json_path = det_dir / f"{seq_name}.json"
+            if not det_json_path.exists():
+                if verbose:
+                    print(f"[tracker_eval] WARNING: missing detections file: {det_json_path} (skipping)")
+                continue
 
-        if skip_existing_kitti and write_kitti_txt and out_kitti_txt.exists():
+            out_kitti_txt = out_kitti_dir / f"{seq_name}.txt"
+
+            if skip_existing_kitti and write_kitti_txt and out_kitti_txt.exists():
+                if verbose:
+                    print(f"[tracker_eval] ({idx+1}/{len(seqs)}) {seq_name}: output exists, skipping")
+                per_seq_rows.append(
+                    {
+                        "seq_name": seq_name,
+                        "status": "skipped_existing",
+                        "out_kitti_txt": str(out_kitti_txt),
+                        "frame_stats_csv": "",
+                    }
+                )
+                continue
+
             if verbose:
-                print(f"[tracker_eval] ({idx+1}/{len(seqs)}) {seq_name}: output exists, skipping")
-            # still record a placeholder row so you know it was skipped
-            per_seq_rows.append(
+                print(f"[tracker_eval] ({idx+1}/{len(seqs)}) Running {seq_name} ...")
+
+            gt_by_frame = None
+            gt_json_path = split_root / labels_subdir / f"{seq_name}.json"
+            if use_gt_if_available and hasattr(tracker, "step_with_gt"):
+                if gt_json_path.exists():
+                    gt_by_frame = load_jrdb_labels_3d(str(gt_json_path))
+                else:
+                    if verbose:
+                        print(f"[tracker_eval]   NOTE: GT not found: {gt_json_path} (running without GT)")
+
+            tracks_by_frame, stats, frame_stats = run_tracker_from_detections_json(
+                seq_name=seq_name,
+                detections_json_path=str(det_json_path),
+                tracker=tracker,
+                warmup_steps=warmup_steps,
+                gt_by_frame=gt_by_frame,
+                timestamps_by_frame=None,
+                profile=True,
+            )
+
+            meta = {
+                "split": split_name,
+                "seq_name": seq_name,
+                "tracker_name": tracker_name,
+                "warmup_steps": int(warmup_steps),
+                "detections_json": str(det_json_path),
+                "gt_json": str(gt_json_path) if gt_by_frame is not None else "",
+            }
+
+            write_sequence_outputs(
+                seq_name=seq_name,
+                tracks_by_frame=tracks_by_frame,
+                out_kitti_txt=str(out_kitti_txt) if write_kitti_txt else None,
+                kitti_use_score=kitti_use_score,
+            )
+
+            frame_stats_path = out_frame_stats_dir / f"{seq_name}.csv"
+            fieldnames = [
+                "frame_id", "frame_idx", "timestamp_s",
+                "step_ms", "fps_inst",
+                "num_det_in", "num_tracks_out", "num_gt",
+                "is_warmup",
+            ]
+            _write_csv(frame_stats_path, frame_stats, fieldnames=fieldnames)
+
+            seq_stats.append(stats)
+
+            row = stats.as_dict()
+            row.update(
                 {
-                    "seq_name": seq_name,
-                    "status": "skipped_existing",
-                    "out_kitti_txt": str(out_kitti_txt),
-                    "out_tracks_json": str(out_tracks_json) if out_tracks_json else "",
+                    "status": "ok",
+                    "detections_json": str(det_json_path),
+                    "out_kitti_txt": str(out_kitti_txt) if write_kitti_txt else "",
+                    "frame_stats_csv": str(frame_stats_path),
                 }
             )
-            continue
+            per_seq_rows.append(row)
 
-        if verbose:
-            print(f"[tracker_eval] ({idx+1}/{len(seqs)}) Running {seq_name} ...")
-        
-        gt_by_frame = None
-        if use_gt_if_available and hasattr(tracker, "step_with_gt"):
-            gt_json_path = split_root / labels_subdir / f"{seq_name}.json"
-            if gt_json_path.exists():
-                gt_by_frame = load_jrdb_labels_3d(str(gt_json_path))
-            else:
+            if verbose:
+                print(
+                    f"[tracker_eval]   {seq_name}: fps={stats.fps:.2f}, "
+                    f"mean={stats.mean_step_ms:.2f}ms, p90={stats.p90_step_ms:.2f}ms, p99={stats.p99_step_ms:.2f}ms"
+                )
+
+    # ------------------------------------------------------------
+    # Parallel path
+    # ------------------------------------------------------------
+    else:
+        if tracker_spec is None:
+            raise ValueError("Parallel mode requires tracker_spec (picklable tracker configuration).")
+
+        jobs: List[Dict[str, Any]] = []
+        skipped = 0
+
+        for seq_name in seqs:
+            det_json_path = det_dir / f"{seq_name}.json"
+            if not det_json_path.exists():
                 if verbose:
-                    print(f"[tracker_eval]   NOTE: GT not found for headroom: {gt_json_path} (running without GT)")
+                    print(f"[tracker_eval] WARNING: missing detections file: {det_json_path} (skipping)")
+                continue
 
-        # Run sequence
-        tracks_by_frame, stats = run_tracker_from_detections_json(
-            seq_name=seq_name,
-            detections_json_path=str(det_json_path),
-            tracker=tracker,
-            warmup_steps=warmup_steps,
-            gt_by_frame=gt_by_frame,   # <-- add
-        )
+            out_kitti_txt = out_kitti_dir / f"{seq_name}.txt"
 
+            if skip_existing_kitti and write_kitti_txt and out_kitti_txt.exists():
+                skipped += 1
+                per_seq_rows.append(
+                    {
+                        "seq_name": seq_name,
+                        "status": "skipped_existing",
+                        "out_kitti_txt": str(out_kitti_txt),
+                        "frame_stats_csv": "",
+                    }
+                )
+                continue
 
-        # Write outputs
-        meta = {
-            "split": split_name,
-            "seq_name": seq_name,
-            "tracker_name": tracker_name,
-            "warmup_steps": int(warmup_steps),
-            "detections_json": str(det_json_path),
-            "gt_json": str(gt_json_path) if gt_by_frame is not None else "",
-        }
+            jobs.append(
+                {
+                    "seq_name": seq_name,
+                    "det_json_path": str(det_json_path),
+                    "out_kitti_txt": str(out_kitti_txt) if write_kitti_txt else "",
+                    "kitti_use_score": bool(kitti_use_score),
+                    "warmup_steps": int(warmup_steps),
 
-        write_sequence_outputs(
-            seq_name=seq_name,
-            tracks_by_frame=tracks_by_frame,
-            out_tracks_json=str(out_tracks_json) if out_tracks_json is not None else None,
-            out_kitti_txt=str(out_kitti_txt) if write_kitti_txt else None,
-            kitti_use_score=kitti_use_score,
-            meta=meta,
-        )
+                    "tracker_spec": tracker_spec,
+                    "split_name": str(split_name),
+                    "tracker_name": str(tracker_name),
 
-        seq_stats.append(stats)
-
-        row = stats.as_dict()
-        row.update(
-            {
-                "status": "ok",
-                "detections_json": str(det_json_path),
-                "out_kitti_txt": str(out_kitti_txt) if write_kitti_txt else "",
-                "out_tracks_json": str(out_tracks_json) if out_tracks_json is not None else "",
-            }
-        )
-        per_seq_rows.append(row)
+                    "split_root": str(split_root),
+                    "labels_subdir": str(labels_subdir),
+                    "use_gt_if_available": bool(use_gt_if_available),
+                }
+            )
 
         if verbose:
-            print(
-                f"[tracker_eval]   {seq_name}: fps={stats.fps:.2f}, "
-                f"mean={stats.mean_step_ms:.2f}ms, p90={stats.p90_step_ms:.2f}ms, p99={stats.p99_step_ms:.2f}ms"
-            )
+            print(f"[tracker_eval] Parallel: scheduling {len(jobs)} job(s) (skipped={skipped}).")
+
+        nw = num_workers if num_workers > 0 else (os.cpu_count() or 1)
+        import concurrent.futures
+        import multiprocessing as mp
+        ctx = mp.get_context(parallel_start_method)
+
+        done = 0
+        total = len(jobs)
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=nw, mp_context=ctx) as ex:
+            futs = [ex.submit(_run_one_sequence_worker, job) for job in jobs]
+
+            try:
+                for fut in concurrent.futures.as_completed(futs):
+                    row = fut.result()
+                    per_seq_rows.append(row)
+
+                    done += 1
+
+                    # In parallel mode: keep counts correct, timings at 0
+                    if row.get("status") == "ok":
+                        seq_stats.append(
+                            SequenceRunStats(
+                                seq_name=str(row.get("seq_name", "")),
+                                num_frames=int(row.get("num_frames", 0)),
+                                total_time_s=0.0,
+                                fps=0.0,
+                                mean_step_ms=0.0,
+                                p50_step_ms=0.0,
+                                p90_step_ms=0.0,
+                                p99_step_ms=0.0,
+                            )
+                        )
+
+                    if verbose:
+                        print(f"[tracker_eval]   Done: {row.get('seq_name', '')} ({done}/{total})")
+
+            except KeyboardInterrupt:
+                if verbose:
+                    print("\n[tracker_eval] Ctrl+C received. Cancelling and terminating workers...")
+
+                # Cancel futures that haven't started
+                for f in futs:
+                    f.cancel()
+
+                # Stop accepting work and don't wait
+                ex.shutdown(wait=False, cancel_futures=True)
+
+                # Terminate worker processes (private API but effective)
+                procs = getattr(ex, "_processes", {})
+                for p in list(procs.values()):
+                    try:
+                        if p.is_alive():
+                            p.terminate()
+                    except Exception:
+                        pass
+
+                # Escalate if needed
+                time.sleep(0.2)
+                for p in list(procs.values()):
+                    try:
+                        if p.is_alive():
+                            p.kill()
+                    except Exception:
+                        pass
+
+                raise
 
     # Build summary
     agg = _aggregate_sequence_stats(seq_stats)
@@ -351,6 +664,7 @@ def run_tracker_on_split(
     summary = SplitRunSummary(
         split_name=str(split_name),
         tracker_name=str(tracker_name),
+        # Keep this as the total number of sequences discovered (historical behavior).
         num_sequences=int(len(seqs)),
         num_frames_total=num_frames_total,
         warmup_steps=int(warmup_steps),
@@ -362,7 +676,6 @@ def run_tracker_on_split(
             "out_root": str(out_root),
             "tracker_dir": str(tracker_dir),
             "kitti_dir": str(out_kitti_dir),
-            "tracks_json_dir": str(out_json_dir) if write_tracks_json else "",
         },
     )
 
@@ -370,9 +683,7 @@ def run_tracker_on_split(
     summary_json_path = tracker_dir / "runtime_summary.json"
     _write_json(summary_json_path, asdict(summary))
 
-    # CSV only for successful rows (keeps it clean), but we also include skipped with empty metrics
     csv_path = tracker_dir / "runtime_summary.csv"
-    # Choose stable columns
     fieldnames = [
         "seq_name",
         "status",
@@ -384,18 +695,20 @@ def run_tracker_on_split(
         "p99_step_ms",
         "detections_json",
         "out_kitti_txt",
-        "out_tracks_json",
+        "frame_stats_csv",
     ]
     _write_csv(csv_path, per_seq_rows, fieldnames=fieldnames)
 
     if verbose:
         print(f"[tracker_eval] Wrote summary: {summary_json_path}")
         print(f"[tracker_eval] Wrote CSV:     {csv_path}")
-        if seq_stats:
+        if not parallel and seq_stats:
             print(
                 f"[tracker_eval] Aggregate fps (weighted): {agg['fps']['frame_weighted']:.2f} | "
                 f"mean step ms (mean-of-mean): {agg['step_ms']['mean_of_mean']:.2f}"
             )
+        elif parallel:
+            print("[tracker_eval] Parallel mode: timing/per-frame profiling disabled (metrics are 0).")
         else:
             print("[tracker_eval] No sequences were run (all skipped or none found).")
 

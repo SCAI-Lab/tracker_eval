@@ -38,7 +38,7 @@ class GNNPMBConfig:
         Upstream special-case: if classification == 'pedestrian' and Z_k is empty,
         they call extractStates_with_custom_thr(filter_updated, thr=0.7).
     """
-    parameters_path: str
+    parameters_path: str = "/home/scai/trackers/GnnPmbTracker/configs/gnnpmb_parameters.json"
     classification: str = "pedestrian"
     use_nms: bool = True
 

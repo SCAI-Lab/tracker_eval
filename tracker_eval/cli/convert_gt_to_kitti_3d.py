@@ -11,73 +11,12 @@ import numpy as np
 
 from tracker_eval.export.jrdb_kitti_writer import TrackRow3D, write_sequence_kitti_txt
 
-
-def _parse_frame_key(k: str) -> str:
-    # Keep original frame keys (e.g. "000123.pcd") because writer can parse to int
-    return str(k)
-
-
-def _parse_label_id(label_id: str) -> Tuple[str, int]:
-    """
-    "pedestrian:18" -> ("pedestrian", 18)
-    """
-    s = str(label_id)
-    if ":" not in s:
-        raise ValueError(f"Unexpected label_id format (no ':'): {label_id}")
-    cls, tid = s.split(":", 1)
-    cls = cls.strip()
-    tid_i = int(tid)
-    return cls, tid_i
-
-
-def _box7_from_label_obj(obj: Dict[str, Any]) -> np.ndarray:
-    """
-    Accepts box in either dict or list form.
-    Returns internal center box7: (cx, cy, cz, l, w, h, rot_z)
-    """
-    if "box" not in obj:
-        raise ValueError("Missing 'box' in label object.")
-    box = obj["box"]
-    if isinstance(box, dict):
-        needed = ["cx", "cy", "cz", "l", "w", "h", "rot_z"]
-        for k in needed:
-            if k not in box:
-                raise ValueError(f"Missing '{k}' in box dict: keys={list(box.keys())}")
-        cx = float(box["cx"])
-        cy = float(box["cy"])
-        cz = float(box["cz"])
-        l = float(box["l"])
-        w = float(box["w"])
-        h = float(box["h"])
-        rot_z = float(box["rot_z"])
-        return np.array([cx, cy, cz, l, w, h, rot_z], dtype=np.float32)
-    if isinstance(box, (list, tuple)):
-        if len(box) != 7:
-            raise ValueError(f"Box list must have length 7, got {len(box)}")
-        return np.asarray(box, dtype=np.float32).reshape(7,)
-    raise ValueError(f"Unsupported box type: {type(box)}")
-
-
-def _load_labels_3d_json(path: Path) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Returns dict: frame_key -> list of label objects.
-
-    JRDB label json variants:
-      - {"labels": { "000123.pcd": [ {...}, ... ], ... }}
-      - {"annotations": {...}} / {"frames": {...}} / {"data": {...}}
-      - or direct dict { "000123.pcd": [ ... ], ... }
-    """
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    for key in ("labels", "annotations", "frames", "data"):
-        if key in data and isinstance(data[key], dict):
-            return data[key]  # type: ignore[return-value]
-
-    if isinstance(data, dict) and all(isinstance(v, list) for v in data.values()):
-        return data  # type: ignore[return-value]
-
-    raise ValueError(f"Could not find per-frame labels dict in {path}")
+from tracker_eval.utils import (
+    _parse_frame_key,
+    _parse_label_id_strict,
+    _box7_from_label_obj,
+    _load_labels_3d_json,
+)
 
 
 def convert_split_gt(
@@ -145,7 +84,7 @@ def convert_split_gt(
                 label_id = obj.get("label_id", None)
                 if label_id is None:
                     continue
-                cls, tid = _parse_label_id(label_id)
+                cls, tid = _parse_label_id_strict(label_id)
                 if cls.lower() != "pedestrian":
                     continue
                 box7 = _box7_from_label_obj(obj)

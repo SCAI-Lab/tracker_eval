@@ -39,12 +39,12 @@ class CBMOTConfig:
 
     # Core tracker params (PubTracker __init__)
     hungarian: bool = False
-    max_age: int = 40
-    min_hits: int = 1
-    score_decay: float = 0.0          # "noise" in code (score decay for matched tracks)
+    max_age: int = 15
+    min_hits: int = 2
+    score_decay: float = 0.2          # "noise" in code (score decay for matched tracks)
     active_th: float = 1.0
     deletion_th: float = 0.0
-    detection_th: float = 0.0
+    detection_th: float = 0.5
     score_update: Optional[str] = None  # None, 'nn', 'addition', 'max', etc.
     model_path: Optional[str] = None
 

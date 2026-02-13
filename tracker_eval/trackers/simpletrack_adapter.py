@@ -26,7 +26,7 @@ class SimpleTrackConfig:
       - If you later decide to do minimal tweaks (e.g. score_threshold), do it by editing YAML,
         not via code, to preserve benchmark fairness/reproducibility.
     """
-    config_path: str
+    config_path: str = "/home/scai/trackers/SimpleTrack/configs/nu_configs/giou.yaml"
 
 
 class SimpleTrackAdapter(TrackerBase):
