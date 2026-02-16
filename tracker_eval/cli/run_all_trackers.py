@@ -9,12 +9,12 @@ from tracker_eval.cli.run_tracker import main as run_one_tracker_main
 
 
 TRACKER_ORDER = [
-    "headroom",
+    # "headroom",
     # "elptnet",
     # "cbmot",
     # "fastpoly",
     # "ab3dmot",
-    # "gnnpmb",
+    "gnnpmb",
     # "simpletrack",
 ]
 
@@ -23,11 +23,12 @@ TRACKER_ORDER = [
 # Example:
 DEFAULT_WORKERS_PER_TRACKER = {
     "headroom": 8,
-    # "elptnet": 8,
-    # "cbmot": 8,
-    # "fastpoly": 2,
-    # "ab3dmot": 2,
-    # "gnnpmb": 2,
+    "elptnet": 4,
+    "cbmot": 8,
+    "fastpoly": 4,
+    "ab3dmot": 4,
+    "gnnpmb": 6,
+    "simpletrack": 8,
 }
 # DEFAULT_WORKERS_PER_TRACKER = None
 

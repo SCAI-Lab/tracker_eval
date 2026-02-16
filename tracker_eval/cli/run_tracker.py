@@ -269,11 +269,10 @@ def build_argparser() -> argparse.ArgumentParser:
         default=15.0,
         help="FPS used to compute dt if timestamps are not provided (default: 15.0 for JRDB).",
     )
-    g4.add_argument(
-        "--gnnpmb_no_nms",
-        action="store_true",
-        help="Disable upstream NMS inside adapter (default: NMS enabled).",
-    )
+
+    g4.add_argument("--gnnpmb_nms", action="store_true", default=False,
+                    help="Enable upstream NMS inside adapter (default: disabled).")
+
     g4.add_argument(
         "--gnnpmb_giou_gating",
         type=float,
@@ -283,20 +282,21 @@ def build_argparser() -> argparse.ArgumentParser:
     g4.add_argument(
         "--gnnpmb_ped_empty_meas_extract_thr",
         type=float,
-        default=0.7,
+        default=0.5,
         help="If pedestrian and no measurements, use extractStates_with_custom_thr(thr=...) (default: 0.7).",
     )
 
     # CBMOT params
     g5 = p.add_argument_group("CBMOT parameters")
-    g5.add_argument("--cbmot_hungarian", action="store_true")
+    g5.add_argument("--cbmot_hungarian", dest="cbmot_hungarian", action="store_true", default=True)
+    g5.add_argument("--no_cbmot_hungarian", dest="cbmot_hungarian", action="store_false")
     g5.add_argument("--cbmot_max_age", type=int, default=15)
-    g5.add_argument("--cbmot_min_hits", type=int, default=2)
-    g5.add_argument("--cbmot_score_decay", type=float, default=0.2)
-    g5.add_argument("--cbmot_active_th", type=float, default=1.0)
-    g5.add_argument("--cbmot_deletion_th", type=float, default=0.0)
+    g5.add_argument("--cbmot_min_hits", type=int, default=3)
+    g5.add_argument("--cbmot_score_decay", type=float, default=0.05)
+    g5.add_argument("--cbmot_active_th", type=float, default=0.6)
+    g5.add_argument("--cbmot_deletion_th", type=float, default=0.10)
     g5.add_argument("--cbmot_detection_th", type=float, default=0.5)
-    g5.add_argument("--cbmot_score_update", type=str, default=None)
+    g5.add_argument("--cbmot_score_update", type=str, default="max")
     g5.add_argument("--cbmot_model_path", type=str, default=None)
     g5.add_argument("--cbmot_fps", type=float, default=15.0)
     g5.add_argument("--cbmot_track_class", type=str, default="pedestrian")
@@ -320,27 +320,27 @@ def build_argparser() -> argparse.ArgumentParser:
     g7 = p.add_argument_group("Headroom parameters")
     g7.add_argument("--headroom_fps", type=float, default=15.0)
 
-    g7.add_argument("--headroom_T_reid_base_s", type=float, default=1.0)
-    g7.add_argument("--headroom_T_reid_static_s", type=float, default=2.0)
+    g7.add_argument("--headroom_T_reid_base_s", type=float, default=2.5)
+    g7.add_argument("--headroom_T_reid_static_s", type=float, default=5.0)
 
-    g7.add_argument("--headroom_score_floor", type=float, default=0.5)
+    g7.add_argument("--headroom_score_floor", type=float, default=0.0)
     g7.add_argument("--headroom_score_power", type=float, default=1.5)
-    g7.add_argument("--headroom_tau_hit_s", type=float, default=0.10)
-    g7.add_argument("--headroom_tau_miss_s", type=float, default=2.0)
+    g7.add_argument("--headroom_tau_hit_s", type=float, default=0.20)
+    g7.add_argument("--headroom_tau_miss_s", type=float, default=3.0)
     g7.add_argument("--headroom_theta_on", type=float, default=0.50)
-    g7.add_argument("--headroom_min_hits", type=int, default=2)
+    g7.add_argument("--headroom_min_hits", type=int, default=3)
 
-    g7.add_argument("--headroom_T_out_min_s", type=float, default=0.30)
-    g7.add_argument("--headroom_T_out_max_s", type=float, default=1.0)
+    g7.add_argument("--headroom_T_out_min_s", type=float, default=0.50)
+    g7.add_argument("--headroom_T_out_max_s", type=float, default=1.50)
     g7.add_argument("--headroom_T_out_gamma", type=float, default=1.0)
 
-    g7.add_argument("--headroom_dist_gate_m", type=float, default=0.45)
+    g7.add_argument("--headroom_dist_gate_m", type=float, default=0.4)
     g7.add_argument("--headroom_z_gate_m", type=float, default=1.0)
     g7.add_argument("--headroom_assoc_topk", type=int, default=10)
-    g7.add_argument("--headroom_assoc_iou_weight", type=float, default=5.0)
+    g7.add_argument("--headroom_assoc_iou_weight", type=float, default=1.0)
 
-    g7.add_argument("--headroom_v_static_thr_mps", type=float, default=0.20)
-    g7.add_argument("--headroom_jitter_thr_m", type=float, default=0.15)
+    g7.add_argument("--headroom_v_static_thr_mps", type=float, default=0.30)
+    g7.add_argument("--headroom_jitter_thr_m", type=float, default=0.2)
     g7.add_argument("--headroom_static_window", type=int, default=15)
 
     g7.add_argument("--headroom_gt_stride", type=int, default=100000)
@@ -405,7 +405,7 @@ def _build_tracker_and_name(args: argparse.Namespace) -> Tuple[object, str]:
             cfg=GNNPMBConfig(
                 parameters_path=str(args.gnnpmb_parameters_path),
                 classification=str(args.gnnpmb_classification),
-                use_nms=not bool(args.gnnpmb_no_nms),
+                use_nms = bool(args.gnnpmb_nms),
                 fps=float(args.gnnpmb_fps),
                 giou_gating=float(args.gnnpmb_giou_gating),
                 ped_empty_meas_extract_thr=float(args.gnnpmb_ped_empty_meas_extract_thr),
@@ -525,7 +525,7 @@ def _build_tracker_spec(args: argparse.Namespace) -> Dict[str, Any]:
         spec["cfg"] = {
             "parameters_path": str(args.gnnpmb_parameters_path),
             "classification": str(args.gnnpmb_classification),
-            "use_nms": not bool(args.gnnpmb_no_nms),
+            "use_nms": bool(args.gnnpmb_nms),
             "fps": float(args.gnnpmb_fps),
             "giou_gating": float(args.gnnpmb_giou_gating),
             "ped_empty_meas_extract_thr": float(args.gnnpmb_ped_empty_meas_extract_thr),

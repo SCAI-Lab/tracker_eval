@@ -53,15 +53,15 @@ class HeadroomConfig:
     assoc_topk: int = 10  # max candidates per track (after radius query)
 
     # Assignment cost: cost = (1 - iou) * assoc_iou_weight + dist
-    assoc_iou_weight: float = 0.5
+    assoc_iou_weight: float = 1.0
     forbidden_cost: float = 1e6  # used for non-edges in Hungarian
 
     # Evidence model (smoothed score + miss decay + hysteresis)
-    score_floor: float = 0.50     # scores <= floor contribute ~0 evidence
+    score_floor: float = 0.5     # scores <= floor contribute ~0 evidence
     score_power: float = 1.5      # x = s_norm^p
     tau_hit_s: float = 0.1       # evidence rise time constant (seconds)
     tau_miss_s: float = 2.0      # evidence decay time constant (seconds)
-    theta_on: float = 0.5        # confirm threshold
+    theta_on: float = 0.50        # confirm threshold
     min_hits: int = 2             # min matched detections before first confirmation
 
     # Output coasting after miss (seconds), based on CURRENT evidence (not peak)
@@ -420,7 +420,6 @@ class HeadroomAdapter(TrackerBase):
         # ---- Predict (advance out_box) for all tracks ----
         # GT tracks: use GT displacement when available
         for gid, tr in self._gt_tracks.items():
-            # Advance only once per frame
             if tr.last_pred_t < t_now - 1e-12:
                 self._predict_track(tr, dt_frame, gt_now=gt_now)
                 tr.last_pred_t = t_now
@@ -446,14 +445,22 @@ class HeadroomAdapter(TrackerBase):
             det_boxes.append(d.box)
             det_scores.append(d.score)
 
-        det_xy = np.array([[b.cx, b.cy] for b in det_boxes], dtype=np.float64) if det_boxes else np.zeros((0, 2), dtype=np.float64)
+        det_xy = (
+            np.array([[b.cx, b.cy] for b in det_boxes], dtype=np.float64)
+            if det_boxes else np.zeros((0, 2), dtype=np.float64)
+        )
         det_corners, det_areas = _precompute_bev_rects(det_boxes)
 
-        # ---- 1) Assign detections to GT tracks ----
+        # ============================================================
+        # 1) Assign detections to GT tracks (unchanged)
+        # ============================================================
         gt_ids = list(self._gt_tracks.keys())
         gt_boxes = [self._gt_tracks[gid].out_box for gid in gt_ids]
 
-        gt_xy = np.array([[b.cx, b.cy] for b in gt_boxes], dtype=np.float64) if gt_boxes else np.zeros((0, 2), dtype=np.float64)
+        gt_xy = (
+            np.array([[b.cx, b.cy] for b in gt_boxes], dtype=np.float64)
+            if gt_boxes else np.zeros((0, 2), dtype=np.float64)
+        )
         gt_corners, gt_areas = _precompute_bev_rects(gt_boxes)
 
         gt_edges = _build_candidates(
@@ -470,7 +477,6 @@ class HeadroomAdapter(TrackerBase):
         )
         gt_matches_local = _assign_component_hungarian(cfg, len(gt_boxes), len(det_boxes), gt_edges)
 
-        # Translate to (gt_id, det_global_index)
         gt_matches: Dict[int, int] = {}  # gt_id -> det_idx_in_det_list
         used_det_local: Set[int] = set()
         for ti, dj in gt_matches_local:
@@ -488,7 +494,6 @@ class HeadroomAdapter(TrackerBase):
                 if det.box is None:
                     continue
 
-                # If track was expired (miss_dt > T_reid), start a new epoch now (new output id, fresh evidence)
                 is_static = self._is_static(tr)
                 T_reid = float(cfg.T_reid_static_s if is_static else cfg.T_reid_base_s)
                 miss_dt = float(t_now - tr.last_seen_t)
@@ -500,7 +505,6 @@ class HeadroomAdapter(TrackerBase):
                 else:
                     tr.expired = False
 
-                # Evidence + motion update
                 dt_obs = max(1e-6, t_now - tr.last_seen_t)
                 self._evidence_on_match(tr, det.score, dt_frame)
 
@@ -511,14 +515,18 @@ class HeadroomAdapter(TrackerBase):
 
                 self._gt_tracks[gid] = tr
             else:
-                # miss: evidence decay (do not delete GT track)
                 self._evidence_on_miss(tr, dt_frame)
                 self._gt_tracks[gid] = tr
 
-        # ---- 2) FP association on remaining detections ----
-        remaining_det_boxes: List[Box3D] = []
-        remaining_det_map: List[int] = []  # local remaining -> global det_list index
+        # ============================================================
+        # 2) FP association on remaining detections (CONFIRMED-FIRST)
+        # ============================================================
 
+        # Remaining detections after GT matching, expressed as:
+        #  - remaining_det_boxes: boxes to match against FP tracks
+        #  - remaining_det_map: local index -> global det_list index
+        remaining_det_boxes: List[Box3D] = []
+        remaining_det_map: List[int] = []
         for local_j, global_i in enumerate(det_indices):
             if local_j in used_det_local:
                 continue
@@ -528,75 +536,118 @@ class HeadroomAdapter(TrackerBase):
             remaining_det_map.append(global_i)
             remaining_det_boxes.append(d.box)
 
-        # Build remaining arrays
-        rem_xy = np.array([[b.cx, b.cy] for b in remaining_det_boxes], dtype=np.float64) if remaining_det_boxes else np.zeros((0, 2), dtype=np.float64)
+        rem_xy = (
+            np.array([[b.cx, b.cy] for b in remaining_det_boxes], dtype=np.float64)
+            if remaining_det_boxes else np.zeros((0, 2), dtype=np.float64)
+        )
         rem_corners, rem_areas = _precompute_bev_rects(remaining_det_boxes)
 
-        fp_tids = list(self._fp_tracks.keys())
-        fp_boxes = [self._fp_tracks[tid].out_box for tid in fp_tids]
-        fp_xy = np.array([[b.cx, b.cy] for b in fp_boxes], dtype=np.float64) if fp_boxes else np.zeros((0, 2), dtype=np.float64)
-        fp_corners, fp_areas = _precompute_bev_rects(fp_boxes)
-
-        fp_edges = _build_candidates(
-            cfg,
-            fp_boxes,
-            remaining_det_boxes,
-            gt_xy=fp_xy,
-            det_xy=rem_xy,
-            gt_corners=fp_corners,
-            gt_areas=fp_areas,
-            det_corners=rem_corners,
-            det_areas=rem_areas,
-            min_iou=0.0,  # IMPORTANT: tracker should not prune by IoU
-        )
-        fp_matches_local = _assign_component_hungarian(cfg, len(fp_boxes), len(remaining_det_boxes), fp_edges)
-
+        # Split FP tracks by confirmed state
+        fp_confirmed_tids: List[int] = []
+        fp_tentative_tids: List[int] = []
+        for tid, tr in self._fp_tracks.items():
+            if tr.confirmed:
+                fp_confirmed_tids.append(int(tid))
+            else:
+                fp_tentative_tids.append(int(tid))
 
         fp_matched_tids: Set[int] = set()
         fp_used_det_locals: Set[int] = set()
 
-        for ti, dj in fp_matches_local:
-            tid = int(fp_tids[ti])
-            tr = self._fp_tracks[tid]
-            det_global_i = int(remaining_det_map[dj])
-            det = det_list[det_global_i]
-            if det.box is None:
-                continue
+        # Helper: run one FP matching pass for a given subset of tids,
+        # using only currently-available remaining detections.
+        def _match_fp_subset(fp_tids_subset: List[int]) -> None:
+            nonlocal fp_matched_tids, fp_used_det_locals
 
-            dt_obs = max(1e-6, t_now - tr.last_seen_t)
-            self._evidence_on_match(tr, det.score, dt_frame)
+            if not fp_tids_subset or not remaining_det_boxes:
+                return
 
-            tr.obs_box = det.box
-            tr.out_box = det.box
-            tr.last_seen_t = t_now
-            tr.push_observation(cfg, det.box, dt_obs)
+            # Build "available detections" view after previous FP pass consumption
+            avail_det_locals = [j for j in range(len(remaining_det_boxes)) if j not in fp_used_det_locals]
+            if not avail_det_locals:
+                return
 
-            self._fp_tracks[tid] = tr
-            fp_matched_tids.add(tid)
-            fp_used_det_locals.add(dj)
+            avail_boxes = [remaining_det_boxes[j] for j in avail_det_locals]
 
-        # FP misses: decay + delete after T_reid
+            avail_xy = (
+                np.array([[b.cx, b.cy] for b in avail_boxes], dtype=np.float64)
+                if avail_boxes else np.zeros((0, 2), dtype=np.float64)
+            )
+            avail_corners, avail_areas = _precompute_bev_rects(avail_boxes)
+
+            fp_boxes_subset = [self._fp_tracks[tid].out_box for tid in fp_tids_subset]
+            fp_xy = (
+                np.array([[b.cx, b.cy] for b in fp_boxes_subset], dtype=np.float64)
+                if fp_boxes_subset else np.zeros((0, 2), dtype=np.float64)
+            )
+            fp_corners, fp_areas = _precompute_bev_rects(fp_boxes_subset)
+
+            edges = _build_candidates(
+                cfg,
+                fp_boxes_subset,
+                avail_boxes,
+                gt_xy=fp_xy,
+                det_xy=avail_xy,
+                gt_corners=fp_corners,
+                gt_areas=fp_areas,
+                det_corners=avail_corners,
+                det_areas=avail_areas,
+                min_iou=0.0,
+            )
+            matches_local = _assign_component_hungarian(cfg, len(fp_boxes_subset), len(avail_boxes), edges)
+
+            for ti, dj in matches_local:
+                tid = int(fp_tids_subset[ti])
+                tr = self._fp_tracks[tid]
+
+                # dj is local index into avail_boxes -> map back to remaining_det_boxes local index
+                det_local = int(avail_det_locals[dj])
+                det_global_i = int(remaining_det_map[det_local])
+                det = det_list[det_global_i]
+                if det.box is None:
+                    continue
+
+                dt_obs = max(1e-6, t_now - tr.last_seen_t)
+                self._evidence_on_match(tr, det.score, dt_frame)
+
+                tr.obs_box = det.box
+                tr.out_box = det.box
+                tr.last_seen_t = t_now
+                tr.push_observation(cfg, det.box, dt_obs)
+
+                self._fp_tracks[tid] = tr
+                fp_matched_tids.add(tid)
+                fp_used_det_locals.add(det_local)
+
+        # Pass 1: confirmed FP tracks get first shot
+        _match_fp_subset(fp_confirmed_tids)
+
+        # Pass 2: tentative FP tracks can use remaining detections
+        _match_fp_subset(fp_tentative_tids)
+
+        # ---- FP misses: decay + delete after T_reid (unchanged logic, but uses fp_matched_tids) ----
         fp_to_delete: List[int] = []
-        for tid in fp_tids:
-            if tid in fp_matched_tids:
+        for tid, tr in list(self._fp_tracks.items()):
+            tid_i = int(tid)
+            if tid_i in fp_matched_tids:
                 continue
-            tr = self._fp_tracks[tid]
+
             self._evidence_on_miss(tr, dt_frame)
 
             is_static = self._is_static(tr)
             T_reid = float(cfg.T_reid_static_s if is_static else cfg.T_reid_base_s)
             miss_dt = float(t_now - tr.last_seen_t)
             if miss_dt > T_reid:
-                fp_to_delete.append(tid)
+                fp_to_delete.append(tid_i)
             else:
-                self._fp_tracks[tid] = tr
+                self._fp_tracks[tid_i] = tr
 
         for tid in fp_to_delete:
             self._fp_tracks.pop(tid, None)
 
         # ---- Spawn new FP tracks from remaining unmatched detections ----
-        for dj, det_global_i in enumerate(remaining_det_map):
-            if dj in fp_used_det_locals:
+        for det_local, det_global_i in enumerate(remaining_det_map):
+            if det_local in fp_used_det_locals:
                 continue
             det = det_list[det_global_i]
             if det.box is None:
@@ -620,7 +671,6 @@ class HeadroomAdapter(TrackerBase):
                 last_emit_t=0.0,
                 last_pred_t=t_now,
             )
-            # First observation updates evidence/hits, but min_hits prevents same-frame emission.
             self._evidence_on_match(tr, det.score, dt_frame)
             tr.push_observation(cfg, det.box, dt=max(1e-6, dt_frame))
             self._fp_tracks[tid] = tr
@@ -628,7 +678,6 @@ class HeadroomAdapter(TrackerBase):
         # ---- Build output detections (GT + FP) ----
         out_dets: List[Detection] = []
 
-        # GT tracks: never deleted; epoch increments are handled on match after long miss
         for gid, tr in self._gt_tracks.items():
             miss_dt = float(t_now - tr.last_seen_t)
             T_out = self._T_out_from_evidence(tr.evidence)
@@ -646,7 +695,6 @@ class HeadroomAdapter(TrackerBase):
                 tr.last_emit_t = t_now
                 self._gt_tracks[gid] = tr
 
-        # FP tracks: emit only if confirmed and within output coasting window
         for tid, tr in self._fp_tracks.items():
             miss_dt = float(t_now - tr.last_seen_t)
             T_out = self._T_out_from_evidence(tr.evidence)
@@ -662,7 +710,7 @@ class HeadroomAdapter(TrackerBase):
                     )
                 )
                 tr.last_emit_t = t_now
-                self._fp_tracks[tid] = tr
+                self._fp_tracks[int(tid)] = tr
 
         # ---- Update GT cache for displacement ----
         self._prev_gt_by_id = dict(gt_now)

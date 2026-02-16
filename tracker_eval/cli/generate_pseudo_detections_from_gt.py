@@ -90,6 +90,64 @@ def _load_score_distributions_json(path: Path) -> ScoreDistributions:
 
     return ScoreDistributions(tp_scores=tp_arr, fp_scores=fp_arr)
 
+def _load_score_distributions_npz(path: Path) -> ScoreDistributions:
+    """
+    Load TP/FP score arrays from .npz written by build_score_distributions_from_gt_det.py
+
+    Expected keys:
+      - tp_scores: (N,)
+      - fp_scores: (M,)
+
+    Other keys may exist (e.g., score_calib_edges/prec/...), ignored here.
+    """
+    try:
+        d = np.load(path)
+    except Exception as e:
+        raise ValueError(f"Failed to load NPZ score distributions: {path} ({e})") from e
+
+    # Validate keys
+    if "tp_scores" not in d.files or "fp_scores" not in d.files:
+        raise ValueError(
+            f"NPZ score distributions missing 'tp_scores'/'fp_scores'. "
+            f"Got keys={d.files} in {path}"
+        )
+
+    tp_arr = np.asarray(d["tp_scores"], dtype=np.float32).reshape(-1)
+    fp_arr = np.asarray(d["fp_scores"], dtype=np.float32).reshape(-1)
+
+    # Keep only finite and clip to [0,1]
+    tp_arr = tp_arr[np.isfinite(tp_arr)]
+    fp_arr = fp_arr[np.isfinite(fp_arr)]
+    tp_arr = np.clip(tp_arr, 0.0, 1.0)
+    fp_arr = np.clip(fp_arr, 0.0, 1.0)
+
+    if tp_arr.size == 0 or fp_arr.size == 0:
+        raise ValueError(
+            f"Score distributions are empty after filtering. "
+            f"tp={tp_arr.size}, fp={fp_arr.size} (from {path})"
+        )
+
+    return ScoreDistributions(tp_scores=tp_arr, fp_scores=fp_arr)
+
+
+def _load_score_distributions(path: Path) -> ScoreDistributions:
+    """
+    Dispatch loader by file extension.
+    Supports:
+      - .json (arrays JSON)
+      - .npz  (from build_score_distributions_from_gt_det.py)
+    """
+    suf = path.suffix.lower()
+    if suf == ".npz":
+        return _load_score_distributions_npz(path)
+    if suf == ".json":
+        return _load_score_distributions_json(path)
+
+    raise ValueError(
+        f"Unsupported score distributions file type: '{path.suffix}' for {path}. "
+        f"Use .json or .npz."
+    )
+
 
 class ScoreSampler:
     """
@@ -198,7 +256,7 @@ class VariantCfg:
     score_mode: str = "constant"
 
     # Optional: path in YAML; can be overridden by CLI
-    score_dists_json: str = ""
+    score_dists: str = ""
 
 
 def _apply_severity_once(cfg_in: VariantCfg) -> VariantCfg:
@@ -690,7 +748,7 @@ def _variant_cfg_from_dict(name: str, base: Dict[str, Any], override: Dict[str, 
         # scores
         score_value=float(merged.get("score_value", 1.0)),
         score_mode=str(merged.get("score_mode", "constant")),
-        score_dists_json=str(merged.get("score_dists_json", "")),
+        score_dists=str(merged.get("score_dists", "")),
     )
 
     # clip probabilities
@@ -880,8 +938,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--out_detections_subdir", type=str, default="detections_3D_pseudo")
     p.add_argument("--seed", type=int, default=0)
 
-    # New: score distribution file (overrides YAML score_dists_json)
-    p.add_argument("--score_dists_json", type=str, default=None,
+    # New: score distribution file (overrides YAML score_dists)
+    p.add_argument("--score_dists", type=str, default=None,
                    help="Path to JSON containing TP/FP score arrays; enables score_mode=sample if provided.")
 
     p.add_argument("--include_variants", type=str, nargs="*", default=None)
@@ -922,11 +980,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Load global score sampler once (if provided)
     score_sampler: Optional[ScoreSampler] = None
-    score_dists_path_cli = Path(args.score_dists_json) if args.score_dists_json else None
+    score_dists_path_cli = Path(args.score_dists) if args.score_dists else None
     if score_dists_path_cli is not None:
         if not score_dists_path_cli.exists():
-            raise FileNotFoundError(f"--score_dists_json not found: {score_dists_path_cli}")
-        score_sampler = ScoreSampler(_load_score_distributions_json(score_dists_path_cli))
+            raise FileNotFoundError(f"--score_dists not found: {score_dists_path_cli}")
+        score_sampler = ScoreSampler(_load_score_distributions(score_dists_path_cli))
 
     manifest: Dict[str, Any] = {
         "split_root": str(split_root),
@@ -935,7 +993,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "seed": int(args.seed),
         "spec_path": str(spec_path),
         "base": base,
-        "score_dists_json": str(score_dists_path_cli) if score_dists_path_cli is not None else None,
+        "score_dists": str(score_dists_path_cli) if score_dists_path_cli is not None else None,
         "variants": [],
     }
 
@@ -953,20 +1011,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg = _apply_severity_once(cfg_raw)
 
         # Determine per-variant score sampler + mode:
-        #  - CLI score_dists_json overrides everything.
-        #  - Otherwise, if YAML sets score_mode=sample and score_dists_json, load it.
+        #  - CLI score_dists overrides everything.
+        #  - Otherwise, if YAML sets score_mode=sample and score_dists, load it.
         v_score_sampler = score_sampler
         if v_score_sampler is None:
             # Try YAML-provided path
             if cfg.score_mode == "sample":
-                if not cfg.score_dists_json:
+                if not cfg.score_dists:
                     raise ValueError(
-                        f"Variant '{vname}' has score_mode=sample but no score_dists_json set (and no --score_dists_json)."
+                        f"Variant '{vname}' has score_mode=sample but no score_dists set (and no --score_dists)."
                     )
-                p = Path(cfg.score_dists_json)
+                p = Path(cfg.score_dists)
                 if not p.exists():
-                    raise FileNotFoundError(f"Variant '{vname}' score_dists_json not found: {p}")
-                v_score_sampler = ScoreSampler(_load_score_distributions_json(p))
+                    raise FileNotFoundError(f"Variant '{vname}' score_dists not found: {p}")
+                v_score_sampler = ScoreSampler(_load_score_distributions(p))
 
         # If sampler exists, force score_mode to sample (so YAML doesn't accidentally keep constant)
         if v_score_sampler is not None:

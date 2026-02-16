@@ -110,6 +110,142 @@ def _collect_boxes_scores_for_class(
 
     return boxes, scores
 
+def _pava_non_decreasing(y: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """
+    Pool-Adjacent-Violators Algorithm (PAVA) for isotonic regression with non-decreasing constraint.
+    Solves: min sum_i w_i (x_i - y_i)^2  s.t. x_0 <= x_1 <= ... <= x_{n-1}
+    """
+    y = np.asarray(y, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    n = int(y.size)
+    if n == 0:
+        return y
+
+    # Blocks: each block has (start, end_exclusive, sum_w, sum_wy)
+    starts: List[int] = []
+    ends: List[int] = []
+    sum_w: List[float] = []
+    sum_wy: List[float] = []
+
+    for i in range(n):
+        wi = float(max(0.0, w[i]))
+        yi = float(y[i])
+        starts.append(i)
+        ends.append(i + 1)
+        sum_w.append(wi)
+        sum_wy.append(wi * yi)
+
+        # Merge while violating monotonicity
+        while len(starts) >= 2:
+            k = len(starts) - 1
+            k0 = k - 1
+
+            v0 = (sum_wy[k0] / sum_w[k0]) if sum_w[k0] > 0.0 else 0.0
+            v1 = (sum_wy[k] / sum_w[k]) if sum_w[k] > 0.0 else 0.0
+            if v0 <= v1 + 1e-15:
+                break
+
+            # Merge blocks k0 and k
+            ends[k0] = ends[k]
+            sum_w[k0] += sum_w[k]
+            sum_wy[k0] += sum_wy[k]
+            starts.pop()
+            ends.pop()
+            sum_w.pop()
+            sum_wy.pop()
+
+    out = np.zeros(n, dtype=np.float64)
+    for s, e, sw, swy in zip(starts, ends, sum_w, sum_wy):
+        v = (swy / sw) if sw > 0.0 else 0.0
+        out[s:e] = v
+    return out
+
+
+def build_score_calibrator_from_tp_fp(
+    tp_scores: np.ndarray,
+    fp_scores: np.ndarray,
+    *,
+    score_min: float,
+    score_max: float = 1.0,
+    bins: int = 50,
+    laplace: float = 1.0,
+    monotonic: bool = True,
+    edge_mode: str = "uniform",  # "uniform" or "quantile"
+) -> Dict[str, np.ndarray]:
+    """
+    Build a simple score->precision calibrator:
+      precision(bin) = (TP + a) / (TP + FP + 2a)   with a=laplace
+
+    Returns dict with:
+      edges: (bins+1,)
+      prec:  (bins,)
+      tp_counts: (bins,)
+      fp_counts: (bins,)
+    """
+    tp = np.asarray(tp_scores, dtype=np.float64)
+    fp = np.asarray(fp_scores, dtype=np.float64)
+
+    smin = float(score_min)
+    smax = float(score_max)
+    smin = max(0.0, min(1.0, smin))
+    smax = max(smin + 1e-9, min(1.0, smax))
+
+    bins = int(max(2, bins))
+    a = float(max(0.0, laplace))
+
+    # Choose bin edges
+    if edge_mode == "quantile":
+        all_scores = np.concatenate([tp, fp], axis=0) if (tp.size + fp.size) > 0 else np.array([], dtype=np.float64)
+        # Restrict to [smin, smax] for stable quantiles
+        if all_scores.size > 0:
+            all_scores = np.clip(all_scores, smin, smax)
+        if all_scores.size >= bins:
+            qs = np.linspace(0.0, 1.0, bins + 1)
+            edges = np.quantile(all_scores, qs)
+            edges[0] = smin
+            edges[-1] = smax
+            # If quantiles collapse (duplicate edges), fall back to uniform
+            if np.unique(edges).size < (bins + 1):
+                edges = np.linspace(smin, smax, bins + 1, dtype=np.float64)
+        else:
+            edges = np.linspace(smin, smax, bins + 1, dtype=np.float64)
+    else:
+        edges = np.linspace(smin, smax, bins + 1, dtype=np.float64)
+
+    # Histogram TP/FP in bins
+    tp_clip = np.clip(tp, edges[0], edges[-1] - 1e-12) if tp.size else tp
+    fp_clip = np.clip(fp, edges[0], edges[-1] - 1e-12) if fp.size else fp
+
+    tp_counts, _ = np.histogram(tp_clip, bins=edges)
+    fp_counts, _ = np.histogram(fp_clip, bins=edges)
+
+    tp_counts = tp_counts.astype(np.float64)
+    fp_counts = fp_counts.astype(np.float64)
+
+    denom = tp_counts + fp_counts
+    base_rate = float(tp.size / max(1.0, (tp.size + fp.size)))
+
+    # Laplace/Beta(a,a) smoothing
+    prec = (tp_counts + a) / (denom + 2.0 * a)
+
+    # Fill completely empty bins with global base rate (keeps things sane)
+    empty = denom <= 0.0
+    if np.any(empty):
+        prec[empty] = base_rate
+
+    # Optional monotonic non-decreasing enforcement with isotonic regression
+    if bool(monotonic):
+        w = denom.copy()
+        # give empty bins tiny weight so they don't dominate
+        w[empty] = 1e-6
+        prec = _pava_non_decreasing(prec, w)
+
+    return {
+        "edges": edges.astype(np.float32),
+        "prec": prec.astype(np.float32),
+        "tp_counts": tp_counts.astype(np.float32),
+        "fp_counts": fp_counts.astype(np.float32),
+    }
 
 # ============================================================
 # Main processing
@@ -132,6 +268,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--assoc_iou_weight", type=float, default=5.0)
     p.add_argument("--tp_iou_thr", type=float, default=0.25)
     p.add_argument("--forbidden_cost", type=float, default=1e6)
+
+    # ---- score calibration output ----
+    p.add_argument("--write_calibrator", action="store_true",
+                   help="If set, also write a score calibrator (binned precision curve) into the output npz.")
+    p.add_argument("--calib_bins", type=int, default=50)
+    p.add_argument("--calib_laplace", type=float, default=1.0)
+    p.add_argument("--calib_monotonic", type=int, default=1, help="1=on, 0=off")
+    p.add_argument("--calib_edge_mode", type=str, default="uniform", choices=["uniform", "quantile"])
+
 
     p.add_argument("--out_dir", type=str, required=True)
     p.add_argument("--out_prefix", type=str, default=None)
@@ -261,7 +406,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     tp_arr = np.asarray(tp_scores_all, dtype=np.float32)
     fp_arr = np.asarray(fp_scores_all, dtype=np.float32)
 
-    np.savez_compressed(out_npz, tp_scores=tp_arr, fp_scores=fp_arr)
+    save_dict: Dict[str, Any] = {"tp_scores": tp_arr, "fp_scores": fp_arr}
+
+    if bool(args.write_calibrator):
+        calib = build_score_calibrator_from_tp_fp(
+            tp_arr, fp_arr,
+            score_min=float(args.min_det_score),
+            score_max=1.0,
+            bins=int(args.calib_bins),
+            laplace=float(args.calib_laplace),
+            monotonic=bool(int(args.calib_monotonic)),
+            edge_mode=str(args.calib_edge_mode),
+        )
+        # Store under stable names for headroom_adapter.py
+        save_dict.update(
+            score_calib_edges=calib["edges"],
+            score_calib_prec=calib["prec"],
+            score_calib_tp_counts=calib["tp_counts"],
+            score_calib_fp_counts=calib["fp_counts"],
+        )
+
+    np.savez_compressed(out_npz, **save_dict)
+
 
     summary: Dict[str, Any] = {
         "dataset_root": str(root),
@@ -283,6 +449,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             ),
         },
     }
+
+    if bool(args.write_calibrator):
+        summary["score_calibrator"] = {
+            "bins": int(args.calib_bins),
+            "laplace": float(args.calib_laplace),
+            "monotonic": bool(int(args.calib_monotonic)),
+            "edge_mode": str(args.calib_edge_mode),
+            "keys_in_npz": [
+                "score_calib_edges",
+                "score_calib_prec",
+                "score_calib_tp_counts",
+                "score_calib_fp_counts",
+            ],
+            "score_range": [float(args.min_det_score), 1.0],
+        }
 
     with out_summary.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
