@@ -227,7 +227,9 @@ def _build_tracker_from_spec(spec: Dict[str, Any]) -> Tracker3D:
 
     if tracker_key == "headroom":
         from tracker_eval.trackers.headroom_adapter import HeadroomAdapter, HeadroomConfig
-        tcfg = HeadroomConfig(
+        from tracker_eval.trackers.headroom_kf_adapter import HeadroomTrackerKF, HeadroomKFConfig
+        # tcfg = HeadroomConfig(
+        tcfg = HeadroomKFConfig(
             fps=float(cfg.get("fps", 15.0)),
 
             T_reid_base_s=float(cfg.get("T_reid_base_s", 1.0)),
@@ -256,7 +258,8 @@ def _build_tracker_from_spec(spec: Dict[str, Any]) -> Tracker3D:
             gt_stride=int(cfg.get("gt_stride", 100000)),
             fp_offset=int(cfg.get("fp_offset", 10000000)),
         )
-        return HeadroomAdapter(cfg=tcfg)
+        # return HeadroomAdapter(cfg=tcfg)
+        return HeadroomTrackerKF(cfg=tcfg)
 
     raise ValueError(f"Unknown tracker in spec: {tracker_key}")
 

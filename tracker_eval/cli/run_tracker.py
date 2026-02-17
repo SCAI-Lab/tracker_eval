@@ -15,6 +15,7 @@ from tracker_eval.trackers.fastpoly_adapter import FastPolyAdapter, FastPolyConf
 from tracker_eval.trackers.gnnpmbtracker_adapter import GNNPMBAdapter, GNNPMBConfig
 from tracker_eval.trackers.cbmot_adapter import CBMOTAdapter, CBMOTConfig
 from tracker_eval.trackers.headroom_adapter import HeadroomAdapter, HeadroomConfig
+from tracker_eval.trackers.headroom_kf_adapter import HeadroomTrackerKF, HeadroomKFConfig
 
 
 def _parse_list_arg(xs: Optional[List[str]]) -> Optional[List[str]]:
@@ -337,7 +338,8 @@ def build_argparser() -> argparse.ArgumentParser:
     g7.add_argument("--headroom_dist_gate_m", type=float, default=0.4)
     g7.add_argument("--headroom_z_gate_m", type=float, default=1.0)
     g7.add_argument("--headroom_assoc_topk", type=int, default=10)
-    g7.add_argument("--headroom_assoc_iou_weight", type=float, default=1.0)
+    # g7.add_argument("--headroom_assoc_iou_weight", type=float, default=1.0)
+    g7.add_argument("--headroom_assoc_iou_weight", type=float, default=0.5)
 
     g7.add_argument("--headroom_v_static_thr_mps", type=float, default=0.30)
     g7.add_argument("--headroom_jitter_thr_m", type=float, default=0.2)
@@ -448,7 +450,8 @@ def _build_tracker_and_name(args: argparse.Namespace) -> Tuple[object, str]:
         return tracker, tracker.name
 
     if args.tracker == "headroom":
-        cfg = HeadroomConfig(
+        # cfg = HeadroomConfig(
+        cfg = HeadroomKFConfig(
             fps=float(args.headroom_fps),
 
             T_reid_base_s=float(args.headroom_T_reid_base_s),
@@ -477,7 +480,8 @@ def _build_tracker_and_name(args: argparse.Namespace) -> Tuple[object, str]:
             gt_stride=int(args.headroom_gt_stride),
             fp_offset=int(args.headroom_fp_offset),
         )
-        tracker = HeadroomAdapter(cfg=cfg)
+        # tracker = HeadroomAdapter(cfg=cfg)
+        tracker = HeadroomTrackerKF(cfg=cfg)
         return tracker, tracker.name
 
     raise ValueError(f"Unsupported tracker: {args.tracker}")

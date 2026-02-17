@@ -511,16 +511,27 @@ def _assign_component_hungarian(
     nG: int,
     nD: int,
     edges: List[Tuple[int, int, float, float]],
+    *,
+    track_miss_dt: Optional[np.ndarray] = None,   # length nG, indexed by global gi
 ) -> List[Tuple[int, int]]:
     """
     Component-wise Hungarian (or greedy fallback).
     Uses cfg.assoc_iou_weight and cfg.forbidden_cost.
+
+    Optional: adds staleness penalty per track-row:
+      cost += stale_lambda_m_per_s * min(miss_dt, stale_cap_s)
     """
     if nG == 0 or nD == 0 or not edges:
         return []
 
     W = float(getattr(cfg, "assoc_iou_weight"))
     big = float(getattr(cfg, "forbidden_cost"))
+
+    # ---- staleness params (safe defaults) ----
+    lam = float(getattr(cfg, "stale_lambda_m_per_s", 0.0))
+    cap = float(getattr(cfg, "stale_cap_s", 0.0))
+
+    use_stale = (track_miss_dt is not None) and (lam > 0.0) and (cap > 0.0)
 
     uf = _UnionFind(nG + nD)
     for gi, dj, _, _ in edges:
@@ -558,6 +569,17 @@ def _assign_component_hungarian(
             if c < cost[ii, jj]:
                 cost[ii, jj] = c
 
+        # ---- ADD THIS: per-row staleness penalty ----
+        if use_stale:
+            # penalty in "meters" so it is comparable to dist
+            row_pen = np.zeros((ng,), dtype=np.float64)
+            for ii, gi in enumerate(Gset):
+                md = float(track_miss_dt[int(gi)])  # gi is global index in [0..nG)
+                md = max(0.0, md)
+                md = min(md, cap)
+                row_pen[ii] = lam * md
+            cost += row_pen[:, None]
+
         if linear_sum_assignment is None:
             flat: List[Tuple[float, int, int]] = []
             for ii in range(ng):
@@ -582,6 +604,7 @@ def _assign_component_hungarian(
             matches.append((Gset[ii], Dset[jj]))
 
     return matches
+
 
 
 # ============================================================

@@ -27,6 +27,32 @@ from tracker_eval.utils import (
 def _clamp(x: float, lo: float, hi: float) -> float:
     return float(min(hi, max(lo, x)))
 
+def _gain_from_tau(dt: float, tau: float) -> float:
+    tau = max(1e-6, float(tau))
+    dt = max(1e-6, float(dt))
+    return float(1.0 - math.exp(-dt / tau))
+
+def _norm2(xy: Tuple[float, float]) -> float:
+    return float(math.sqrt(xy[0]*xy[0] + xy[1]*xy[1]))
+
+def _dot(a, b) -> float:
+    return float(a[0]*b[0] + a[1]*b[1])
+
+def _sub(a, b):
+    return (float(a[0]-b[0]), float(a[1]-b[1]))
+
+def _add(a, b):
+    return (float(a[0]+b[0]), float(a[1]+b[1]))
+
+def _mul(a, s: float):
+    return (float(a[0]*s), float(a[1]*s))
+
+def _unit(a):
+    n = _norm2(a)
+    if n < 1e-6:
+        return (1.0, 0.0)
+    return (a[0]/n, a[1]/n)
+
 
 @dataclass(frozen=True)
 class HeadroomConfig:
@@ -79,6 +105,24 @@ class HeadroomConfig:
     jitter_thr_m: float = 0.15
     vel_ema_beta: float = 0.8
 
+    # Staleness penalty (apply to ALL tracks in assignment cost)
+    stale_lambda_m_per_s: float = 0.20   # your 0.2m/1s
+    stale_cap_s: float = 1.5            # clamp miss_dt to this
+
+    # --- anisotropic smoothing params ---
+    tau_par_move_s: float = 0.25     # 0.2–0.3s desired
+    tau_perp_move_s: float = 0.70    # suppress perpendicular jitter more
+    tau_static_s: float = 0.80       # strong smoothing when static
+    tau_vel_s: float = 0.30          # velocity smoothing
+
+    v_enter_mps: float = 0.10        # easy to enter moving
+    v_exit_mps: float = 0.05         # harder to exit moving
+    enter_frames: int = 3            # ~0.2s at 15 Hz
+    exit_frames: int = 8             # ~0.53s at 15 Hz
+
+    dir_consistency_cos: float = 0.5 # require some direction consistency to enter moving
+
+
     # Prediction when GT displacement is not available (and for FP tracks)
     use_const_vel_coast: bool = True
 
@@ -124,6 +168,20 @@ class _TrackState:
     v_ema: float = 0.0
     vel_xy_ema: Tuple[float, float] = (0.0, 0.0)
 
+    # Filtered kinematics (2D)
+    filt_xy: Tuple[float, float] = (0.0, 0.0)
+    filt_vxy: Tuple[float, float] = (0.0, 0.0)
+    prev_filt_xy: Tuple[float, float] = (0.0, 0.0)
+
+    # motion mode hysteresis
+    moving: bool = False
+    move_streak: int = 0
+    still_streak: int = 0
+
+    # for direction consistency checks
+    last_v_meas: Tuple[float, float] = (0.0, 0.0)
+
+
     def reset_epoch_state(self) -> None:
         self.evidence = 0.0
         self.confirmed = False
@@ -131,6 +189,7 @@ class _TrackState:
         self.obs_centers = []
         self.v_ema = 0.0
         self.vel_xy_ema = (0.0, 0.0)
+        
 
     def push_observation(self, cfg: HeadroomConfig, box: Box3D, dt: float) -> None:
         self.obs_centers.append((float(box.cx), float(box.cy)))
@@ -272,6 +331,86 @@ class HeadroomAdapter(TrackerBase):
         my = float(ys.mean())
         rad = float(np.max(np.sqrt((xs - mx) ** 2 + (ys - my) ** 2)))
         return (float(tr.v_ema) < float(cfg.v_static_thr_mps)) and (rad < float(cfg.jitter_thr_m))
+    
+    def _anisotropic_correct(self, tr: _TrackState, det_box: Box3D, dt: float) -> None:
+        cfg = self.cfg
+        dt = float(max(1e-6, dt))
+
+        # predicted position is current out_box center (you already predicted earlier)
+        p_pred = (float(tr.out_box.cx), float(tr.out_box.cy))
+        z = (float(det_box.cx), float(det_box.cy))
+        r = _sub(z, p_pred)
+
+        # --- quick motion estimate from measurements ---
+        v_meas = _mul(_sub(z, tr.prev_filt_xy), 1.0/dt)
+        v_meas_norm = _norm2(v_meas)
+
+        # direction consistency to avoid jitter triggering "moving"
+        last_vm = tr.last_v_meas
+        cos_sim = 0.0
+        if _norm2(last_vm) > 1e-3 and v_meas_norm > 1e-3:
+            cos_sim = _dot(_unit(last_vm), _unit(v_meas))
+
+        tr.last_v_meas = v_meas
+
+        # --- hysteresis: enter moving quickly, exit slowly ---
+        good_dir = (cos_sim >= cfg.dir_consistency_cos) or (_norm2(last_vm) <= 1e-3)
+        if (v_meas_norm >= cfg.v_enter_mps) and good_dir:
+            tr.move_streak += 1
+            tr.still_streak = 0
+        elif v_meas_norm <= cfg.v_exit_mps:
+            tr.still_streak += 1
+            tr.move_streak = 0
+        else:
+            # ambiguous zone: don't flip aggressively
+            tr.move_streak = max(0, tr.move_streak - 1)
+            tr.still_streak = max(0, tr.still_streak - 1)
+
+        if (not tr.moving) and (tr.move_streak >= cfg.enter_frames):
+            tr.moving = True
+        if tr.moving and (tr.still_streak >= cfg.exit_frames):
+            tr.moving = False
+
+        # --- choose gains ---
+        if not tr.moving:
+            # isotropic strong smoothing when static
+            k = _gain_from_tau(dt, cfg.tau_static_s)
+            p_new = _add(p_pred, _mul(r, k))
+        else:
+            # anisotropic smoothing when moving
+            v_hat = tr.filt_vxy
+            if _norm2(v_hat) < 1e-3:
+                v_hat = v_meas
+
+            u = _unit(v_hat)
+            r_par = _mul(u, _dot(r, u))
+            r_perp = _sub(r, r_par)
+
+            k_par = _gain_from_tau(dt, cfg.tau_par_move_s)
+            k_perp = _gain_from_tau(dt, cfg.tau_perp_move_s)
+
+            p_new = _add(p_pred, _add(_mul(r_par, k_par), _mul(r_perp, k_perp)))
+
+        # --- update filtered velocity (EMA on velocity) ---
+        v_new_meas = _mul(_sub(p_new, tr.prev_filt_xy), 1.0/dt)
+        a_v = _gain_from_tau(dt, cfg.tau_vel_s)
+        tr.filt_vxy = _add(_mul(tr.filt_vxy, (1.0 - a_v)), _mul(v_new_meas, a_v))
+
+        tr.prev_filt_xy = p_new
+        tr.filt_xy = p_new
+
+        # write filtered center into out_box (this affects next frame association too)
+        tr.out_box = Box3D(
+            cx=float(p_new[0]),
+            cy=float(p_new[1]),
+            cz=float(det_box.cz),
+            l=float(det_box.l),
+            w=float(det_box.w),
+            h=float(det_box.h),
+            rot_z=float(det_box.rot_z),
+        )
+        tr.obs_box = det_box  # keep raw observation if you still want it
+
 
     # -----------------------------
     # GT helpers
@@ -400,6 +539,7 @@ class HeadroomAdapter(TrackerBase):
         for gid, gbox in gt_now.items():
             if gid not in self._gt_tracks:
                 tid0 = self._gt_tid(gid, 0)
+                xy0 = (float(gbox.cx), float(gbox.cy))
                 tr = _TrackState(
                     tid=int(tid0),
                     is_gt=True,
@@ -414,6 +554,7 @@ class HeadroomAdapter(TrackerBase):
                     last_seen_t=t_now,   # prevents immediate "expiry before ever matched"
                     last_emit_t=0.0,
                     last_pred_t=t_now,
+                    filt_xy=xy0, prev_filt_xy=xy0, filt_vxy=(0.0, 0.0),
                 )
                 self._gt_tracks[gid] = tr
 
@@ -456,6 +597,7 @@ class HeadroomAdapter(TrackerBase):
         # ============================================================
         gt_ids = list(self._gt_tracks.keys())
         gt_boxes = [self._gt_tracks[gid].out_box for gid in gt_ids]
+        gt_miss_dt = np.array([t_now - self._gt_tracks[gid].last_seen_t for gid in gt_ids], dtype=np.float64)
 
         gt_xy = (
             np.array([[b.cx, b.cy] for b in gt_boxes], dtype=np.float64)
@@ -475,7 +617,10 @@ class HeadroomAdapter(TrackerBase):
             det_areas=det_areas,
             min_iou=0.0,  # IMPORTANT: tracker should not prune by IoU
         )
-        gt_matches_local = _assign_component_hungarian(cfg, len(gt_boxes), len(det_boxes), gt_edges)
+        gt_matches_local = _assign_component_hungarian(
+            cfg, len(gt_boxes), len(det_boxes), gt_edges,
+            track_miss_dt=gt_miss_dt
+        )
 
         gt_matches: Dict[int, int] = {}  # gt_id -> det_idx_in_det_list
         used_det_local: Set[int] = set()
@@ -502,14 +647,23 @@ class HeadroomAdapter(TrackerBase):
                     tr.tid = self._gt_tid(int(gid), int(tr.epoch))
                     tr.expired = False
                     tr.reset_epoch_state()
+                    xy = (float(det.box.cx), float(det.box.cy))
+                    tr.filt_xy = xy
+                    tr.prev_filt_xy = xy
+                    tr.filt_vxy = (0.0, 0.0)
+                    tr.moving = False
+                    tr.move_streak = 0
+                    tr.still_streak = 0
+                    tr.last_v_meas = (0.0, 0.0)
                 else:
                     tr.expired = False
 
                 dt_obs = max(1e-6, t_now - tr.last_seen_t)
                 self._evidence_on_match(tr, det.score, dt_frame)
 
-                tr.obs_box = det.box
-                tr.out_box = det.box
+                # tr.obs_box = det.box
+                # tr.out_box = det.box
+                self._anisotropic_correct(tr, det.box, dt_obs)
                 tr.last_seen_t = t_now
                 tr.push_observation(cfg, det.box, dt_obs)
 
@@ -543,13 +697,13 @@ class HeadroomAdapter(TrackerBase):
         rem_corners, rem_areas = _precompute_bev_rects(remaining_det_boxes)
 
         # Split FP tracks by confirmed state
-        fp_confirmed_tids: List[int] = []
-        fp_tentative_tids: List[int] = []
-        for tid, tr in self._fp_tracks.items():
-            if tr.confirmed:
-                fp_confirmed_tids.append(int(tid))
-            else:
-                fp_tentative_tids.append(int(tid))
+        # fp_confirmed_tids: List[int] = []
+        # fp_tentative_tids: List[int] = []
+        # for tid, tr in self._fp_tracks.items():
+        #     if tr.confirmed:
+        #         fp_confirmed_tids.append(int(tid))
+        #     else:
+        #         fp_tentative_tids.append(int(tid))
 
         fp_matched_tids: Set[int] = set()
         fp_used_det_locals: Set[int] = set()
@@ -576,6 +730,7 @@ class HeadroomAdapter(TrackerBase):
             avail_corners, avail_areas = _precompute_bev_rects(avail_boxes)
 
             fp_boxes_subset = [self._fp_tracks[tid].out_box for tid in fp_tids_subset]
+            fp_miss_dt = np.array([t_now - self._fp_tracks[tid].last_seen_t for tid in fp_tids_subset], dtype=np.float64)
             fp_xy = (
                 np.array([[b.cx, b.cy] for b in fp_boxes_subset], dtype=np.float64)
                 if fp_boxes_subset else np.zeros((0, 2), dtype=np.float64)
@@ -594,7 +749,10 @@ class HeadroomAdapter(TrackerBase):
                 det_areas=avail_areas,
                 min_iou=0.0,
             )
-            matches_local = _assign_component_hungarian(cfg, len(fp_boxes_subset), len(avail_boxes), edges)
+            matches_local = _assign_component_hungarian(
+                cfg, len(fp_boxes_subset), len(avail_boxes), edges,
+                track_miss_dt=fp_miss_dt
+            )
 
             for ti, dj in matches_local:
                 tid = int(fp_tids_subset[ti])
@@ -610,8 +768,9 @@ class HeadroomAdapter(TrackerBase):
                 dt_obs = max(1e-6, t_now - tr.last_seen_t)
                 self._evidence_on_match(tr, det.score, dt_frame)
 
-                tr.obs_box = det.box
-                tr.out_box = det.box
+                # tr.obs_box = det.box
+                # tr.out_box = det.box
+                self._anisotropic_correct(tr, det.box, dt_obs)
                 tr.last_seen_t = t_now
                 tr.push_observation(cfg, det.box, dt_obs)
 
@@ -619,11 +778,15 @@ class HeadroomAdapter(TrackerBase):
                 fp_matched_tids.add(tid)
                 fp_used_det_locals.add(det_local)
 
-        # Pass 1: confirmed FP tracks get first shot
-        _match_fp_subset(fp_confirmed_tids)
+        # # Pass 1: confirmed FP tracks get first shot
+        # _match_fp_subset(fp_confirmed_tids)
 
-        # Pass 2: tentative FP tracks can use remaining detections
-        _match_fp_subset(fp_tentative_tids)
+        # # Pass 2: tentative FP tracks can use remaining detections
+        # _match_fp_subset(fp_tentative_tids)
+
+        fp_all_tids = [int(tid) for tid in self._fp_tracks.keys()]
+        _match_fp_subset(fp_all_tids)
+
 
         # ---- FP misses: decay + delete after T_reid (unchanged logic, but uses fp_matched_tids) ----
         fp_to_delete: List[int] = []
@@ -655,7 +818,7 @@ class HeadroomAdapter(TrackerBase):
 
             tid = int(self._fp_next_tid)
             self._fp_next_tid += 1
-
+            xy0 = (float(det.box.cx), float(det.box.cy))
             tr = _TrackState(
                 tid=tid,
                 is_gt=False,
@@ -670,6 +833,7 @@ class HeadroomAdapter(TrackerBase):
                 last_seen_t=t_now,
                 last_emit_t=0.0,
                 last_pred_t=t_now,
+                filt_xy=xy0, prev_filt_xy=xy0, filt_vxy=(0.0, 0.0),
             )
             self._evidence_on_match(tr, det.score, dt_frame)
             tr.push_observation(cfg, det.box, dt=max(1e-6, dt_frame))
