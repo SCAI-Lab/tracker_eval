@@ -212,6 +212,21 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Optional variants to skip (works with --variants or --variants_from_manifest).",
     )
 
+    # Odometry / global coordinate option
+    p.add_argument(
+        "--global_coords",
+        action="store_true",
+        help="If set: transform detections and GT labels into global coordinates using odometry before tracking.",
+    )
+    p.add_argument(
+        "--odometry_root",
+        type=str,
+        default="",
+        help="Root containing odometry CSVs at <odometry_root>/<split_name>/odometry/<seq>.csv. "
+             "Required if --global_coords is set.",
+    )
+
+
     # AB3DMOT params
     g = p.add_argument_group("AB3DMOT parameters")
     g.add_argument("--ab3dmot_max_age", type=int, default=15)
@@ -450,8 +465,8 @@ def _build_tracker_and_name(args: argparse.Namespace) -> Tuple[object, str]:
         return tracker, tracker.name
 
     if args.tracker == "headroom":
-        # cfg = HeadroomConfig(
-        cfg = HeadroomKFConfig(
+        cfg = HeadroomConfig(
+        # cfg = HeadroomKFConfig(
             fps=float(args.headroom_fps),
 
             T_reid_base_s=float(args.headroom_T_reid_base_s),
@@ -480,8 +495,8 @@ def _build_tracker_and_name(args: argparse.Namespace) -> Tuple[object, str]:
             gt_stride=int(args.headroom_gt_stride),
             fp_offset=int(args.headroom_fp_offset),
         )
-        # tracker = HeadroomAdapter(cfg=cfg)
-        tracker = HeadroomTrackerKF(cfg=cfg)
+        tracker = HeadroomAdapter(cfg=cfg)
+        # tracker = HeadroomTrackerKF(cfg=cfg)
         return tracker, tracker.name
 
     raise ValueError(f"Unsupported tracker: {args.tracker}")
@@ -656,6 +671,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 det_subdir = str(Path(args.variants_subdir) / str(v))
                 tracker_name = f"{tracker_base_name}__{v}"
 
+            if bool(args.global_coords):
+                tracker_name = f"{tracker_name}__global"
+
+
             if not args.quiet:
                 print("")
                 print(f"[tracker_eval] Split={split_name} | tracker={tracker_name} | dets={det_subdir}")
@@ -688,6 +707,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 parallel=parallel,
                 num_workers=num_workers,
                 parallel_start_method=start_method,
+
+                global_coords=bool(args.global_coords),
+                odometry_root=str(args.odometry_root),
+
             )
             all_summaries.append(summary)
 

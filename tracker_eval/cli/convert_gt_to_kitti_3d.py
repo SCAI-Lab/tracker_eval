@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from tracker_eval.export.jrdb_kitti_writer import TrackRow3D, write_sequence_kitti_txt
+from tracker_eval.common.types import Box3D, Detection, FrameData
+from tracker_eval.common.odometry_transform import load_odometry_csv, transform_frame_data_to_global
 
 from tracker_eval.utils import (
     _parse_frame_key,
@@ -33,6 +35,8 @@ def convert_split_gt(
     use_score: bool = False,
     bbox2d: Tuple[float, float, float, float] = (-1.0, -1.0, -1.0, -1.0),
     verbose: bool = True,
+    global_coords: bool = False,
+    odometry_root: Optional[Path] = None,
 ) -> None:
     """
     Convert JRDB labels_3d JSON into KITTI-tracking style txt compatible with JRDB3DBox evaluation.
@@ -42,7 +46,7 @@ def convert_split_gt(
 
     Output:
       <out_root>/<out_tracker_name>/<split_name>/<tracker_subfolder>/<seq>.txt
-        e.g. /mnt/nvme/tracker_eval_outputs/GT/train_val/data/<seq>.txt
+        e.g. /mnt/nvme/tracker_eval_outputs/GT/train/data/<seq>.txt
     """
     split_root = Path(split_root)
     if split_name is None:
@@ -52,8 +56,20 @@ def convert_split_gt(
     if not labels_dir.exists():
         raise FileNotFoundError(f"labels_dir not found: {labels_dir}")
 
-    out_dir = out_root / out_tracker_name / split_name / tracker_subfolder
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir_local = out_root / out_tracker_name / split_name / tracker_subfolder
+    out_dir_local.mkdir(parents=True, exist_ok=True)
+
+    out_dir_global = None
+    odo_base = None
+    if global_coords:
+        if odometry_root is None or str(odometry_root).strip() == "":
+            raise ValueError("--global_coords requires --odometry_root")
+        out_dir_global = out_root / f"{out_tracker_name}__global" / split_name / tracker_subfolder
+        out_dir_global.mkdir(parents=True, exist_ok=True)
+
+        # Expected layout: <odometry_root>/<split_name>/odometry/<seq>.csv
+        odo_base = Path(odometry_root) / split_name / "odometry"
+
 
     seq_files = sorted(labels_dir.glob("*.json"))
 
@@ -66,7 +82,11 @@ def convert_split_gt(
 
     if verbose:
         print(f"[tracker_eval] GT convert split '{split_name}': {len(seq_files)} sequence(s) found in {labels_dir}")
-        print(f"[tracker_eval] Writing GT txt to: {out_dir}")
+        print(f"[tracker_eval] Writing GT txt to: {out_dir_local}")
+        if global_coords:
+            print(f"[tracker_eval] Writing GT__global txt to: {out_dir_global}")
+            print(f"[tracker_eval] Using odometry from: {odo_base}")
+
 
     for i, seq_path in enumerate(seq_files):
         seq = seq_path.stem
@@ -75,11 +95,22 @@ def convert_split_gt(
 
         frame_dict = _load_labels_3d_json(seq_path)
 
-        tracks_by_frame: Dict[str, List[TrackRow3D]] = {}
+        tracks_local_by_frame: Dict[str, List[TrackRow3D]] = {}
+        tracks_global_by_frame: Optional[Dict[str, List[TrackRow3D]]] = {} if global_coords else None
+
+        pose_by_idx = None
+        if global_coords:
+            odo_csv = (odo_base / f"{seq}.csv")  # type: ignore[operator]
+            if not odo_csv.exists():
+                raise FileNotFoundError(f"Missing odometry CSV for {seq}: {odo_csv}")
+            pose_by_idx = load_odometry_csv(str(odo_csv))
 
         for frame_key_raw, objs in frame_dict.items():
             frame_key = _parse_frame_key(frame_key_raw)
-            rows: List[TrackRow3D] = []
+
+            dets_local: List[Detection] = []
+            rows_local: List[TrackRow3D] = []
+
             for obj in objs:
                 label_id = obj.get("label_id", None)
                 if label_id is None:
@@ -87,14 +118,52 @@ def convert_split_gt(
                 cls, tid = _parse_label_id_strict(label_id)
                 if cls.lower() != "pedestrian":
                     continue
-                box7 = _box7_from_label_obj(obj)
-                rows.append(TrackRow3D(track_id=int(tid), box7=box7, score=None))
-            tracks_by_frame[frame_key] = rows
 
-        out_txt = out_dir / f"{seq}.txt"
+                box7 = _box7_from_label_obj(obj)  # [cx,cy,cz,l,w,h,rot_z]
+                b = Box3D(
+                    cx=float(box7[0]),
+                    cy=float(box7[1]),
+                    cz=float(box7[2]),
+                    l=float(box7[3]),
+                    w=float(box7[4]),
+                    h=float(box7[5]),
+                    rot_z=float(box7[6]),
+                )
+
+                det = Detection(
+                    frame_id=str(frame_key),
+                    track_id=int(tid),
+                    box=b,
+                    score=None,
+                    label="pedestrian",
+                    raw_label_id=str(label_id),
+                )
+                dets_local.append(det)
+
+                rows_local.append(TrackRow3D(track_id=int(tid), box7=box7, score=None))
+
+            tracks_local_by_frame[frame_key] = rows_local
+
+            if global_coords and tracks_global_by_frame is not None:
+                if pose_by_idx is None:
+                    raise RuntimeError("global_coords=True but pose_by_idx is None (odometry not loaded).")
+
+                fd_local = FrameData(frame_id=str(frame_key), dets=dets_local)
+                fd_global = transform_frame_data_to_global(fd_local, pose_by_idx)
+
+                rows_global: List[TrackRow3D] = []
+                for detg in fd_global.dets:
+                    bg = detg.box
+                    box7g = np.asarray([bg.cx, bg.cy, bg.cz, bg.l, bg.w, bg.h, bg.rot_z], dtype=np.float32)
+                    rows_global.append(TrackRow3D(track_id=int(detg.track_id), box7=box7g, score=None))
+
+                tracks_global_by_frame[frame_key] = rows_global
+
+        # Local GT
+        out_txt_local = out_dir_local / f"{seq}.txt"
         write_sequence_kitti_txt(
-            out_txt,
-            tracks_by_frame,
+            out_txt_local,
+            tracks_local_by_frame,
             class_name=class_name_out,
             truncated=0,
             occluded=0,
@@ -103,6 +172,22 @@ def convert_split_gt(
             use_score=bool(use_score),
             sort_rows=True,
         )
+
+        # Global GT
+        if global_coords and out_dir_global is not None and tracks_global_by_frame is not None:
+            out_txt_global = out_dir_global / f"{seq}.txt"
+            write_sequence_kitti_txt(
+                out_txt_global,
+                tracks_global_by_frame,
+                class_name=class_name_out,
+                truncated=0,
+                occluded=0,
+                alpha=-1.0,
+                bbox2d=bbox2d,
+                use_score=bool(use_score),
+                sort_rows=True,
+            )
+
 
     if verbose:
         print(f"[tracker_eval] GT conversion done for split '{split_name}'.")
@@ -119,7 +204,7 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         nargs="+",
         required=True,
-        help="One or more split roots, e.g. /mnt/nvme/JRDB_track/train_val /mnt/nvme/JRDB_track/test",
+        help="One or more split roots, e.g. /mnt/nvme/JRDB_track/train /mnt/nvme/JRDB_track/test",
     )
     p.add_argument(
         "--split_name",
@@ -146,6 +231,19 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default="data",
         help="Subfolder under .../GT/<split>/ (default: data)",
+    )
+
+    p.add_argument(
+        "--global_coords",
+        action="store_true",
+        help="If set: also export GT transformed to global coordinates using odometry.",
+    )
+    p.add_argument(
+        "--odometry_root",
+        type=str,
+        default="",
+        help="Root containing odometry CSVs at <odometry_root>/<split_name>/odometry/<seq>.csv. "
+            "Required if --global_coords is set.",
     )
 
     p.add_argument("--include_sequences", type=str, nargs="*", default=None)
@@ -190,6 +288,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             use_score=bool(args.use_score),
             bbox2d=bbox2d,
             verbose=not bool(args.quiet),
+            global_coords=bool(args.global_coords),
+            odometry_root=Path(args.odometry_root) if str(args.odometry_root).strip() != "" else None,
         )
     return 0
 

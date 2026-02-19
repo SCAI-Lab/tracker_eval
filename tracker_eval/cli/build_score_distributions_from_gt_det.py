@@ -256,7 +256,7 @@ def build_argparser() -> argparse.ArgumentParser:
         description="Build TP/FP score distributions by matching detections to GT per frame using sparse Hungarian.",
     )
     p.add_argument("--dataset_root", type=str, required=True)
-    p.add_argument("--splits", type=str, nargs="*", default=["train_val", "test"])
+    p.add_argument("--splits", type=str, nargs="*", default=["train", "test"])
     p.add_argument("--detections_subdir", type=str, default="detections_3D")
     p.add_argument("--labels_subdir", type=str, default="labels_3d")
     p.add_argument("--class_name", type=str, default="pedestrian")

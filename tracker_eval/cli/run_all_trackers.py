@@ -10,12 +10,12 @@ from tracker_eval.cli.run_tracker import main as run_one_tracker_main
 
 TRACKER_ORDER = [
     "headroom",
-    # "elptnet",
-    # "cbmot",
+    "elptnet",
+    "cbmot",
     # "fastpoly",
-    # "ab3dmot",
-    # "gnnpmb",
-    # "simpletrack",
+     "ab3dmot",
+    #  "gnnpmb",
+    #  "simpletrack",
 ]
 
 # Optional baked-in default per-tracker workers (only used if you want it).
@@ -158,6 +158,20 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Optional variants to skip (works with --variants or --variants_from_manifest).",
     )
 
+    # Odometry / global coordinate option
+    p.add_argument(
+        "--global_coords",
+        action="store_true",
+        help="If set: transform detections and GT labels into global coordinates using odometry before tracking.",
+    )
+    p.add_argument(
+        "--odometry_root",
+        type=str,
+        default="",
+        help="Root containing odometry CSVs at <odometry_root>/<split_name>/odometry/<seq>.csv. "
+             "Required if --global_coords is set.",
+    )
+
     return p
 
 
@@ -197,6 +211,16 @@ def _append_shared(args: argparse.Namespace, argv: List[str]) -> List[str]:
         argv += ["--variants_subdir", args.variants_subdir]
     if args.variants_from_manifest is not None:
         argv += ["--variants_from_manifest", args.variants_from_manifest]
+
+    # Odometry / global coordinate option
+    if bool(args.global_coords):
+        argv += ["--global_coords"]
+
+        # Only forward odometry_root when global mode is requested
+        if args.odometry_root is None or str(args.odometry_root).strip() == "":
+            raise ValueError("--odometry_root must be set when --global_coords is used.")
+        argv += ["--odometry_root", str(args.odometry_root)]
+
 
     return argv
 

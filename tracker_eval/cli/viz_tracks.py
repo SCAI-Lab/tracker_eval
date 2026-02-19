@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--sequence", required=True, type=str,
                     help="Sequence name (e.g. bytes-cafe-2019-02-07_0)")
     ap.add_argument("--split_name", required=True, type=str,
-                    help="Split name used in your tracker_eval layout (e.g. train_val or test)")
+                    help="Split name used in your tracker_eval layout (e.g. train or test)")
 
     ap.add_argument("--gt_tracker_name", type=str, default="GT",
                     help="Folder name for GT export inside out_root (default: GT).")

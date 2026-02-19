@@ -9,6 +9,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
+import traceback
 
 import numpy as np
 
@@ -16,13 +17,20 @@ from tracker_eval.data.jrdb_io import (
     list_sequence_jsons,
     sequence_name_from_json_filename,
     load_jrdb_labels_3d,
+    load_jrdb_detections_3d,
 )
 
 from tracker_eval.runner.run_sequence import (
     SequenceRunStats,
-    run_tracker_from_detections_json,
+    run_tracker_on_sequence,
     write_sequence_outputs,
     Tracker3D,
+)
+
+from tracker_eval.common.odometry_transform import (
+    load_odometry_csv,
+    transform_sequence_to_global,
+    build_timestamps_by_frame_from_odometry,
 )
 
 
@@ -228,8 +236,8 @@ def _build_tracker_from_spec(spec: Dict[str, Any]) -> Tracker3D:
     if tracker_key == "headroom":
         from tracker_eval.trackers.headroom_adapter import HeadroomAdapter, HeadroomConfig
         from tracker_eval.trackers.headroom_kf_adapter import HeadroomTrackerKF, HeadroomKFConfig
-        # tcfg = HeadroomConfig(
-        tcfg = HeadroomKFConfig(
+        tcfg = HeadroomConfig(
+        # tcfg = HeadroomKFConfig(
             fps=float(cfg.get("fps", 15.0)),
 
             T_reid_base_s=float(cfg.get("T_reid_base_s", 1.0)),
@@ -258,8 +266,8 @@ def _build_tracker_from_spec(spec: Dict[str, Any]) -> Tracker3D:
             gt_stride=int(cfg.get("gt_stride", 100000)),
             fp_offset=int(cfg.get("fp_offset", 10000000)),
         )
-        # return HeadroomAdapter(cfg=tcfg)
-        return HeadroomTrackerKF(cfg=tcfg)
+        return HeadroomAdapter(cfg=tcfg)
+        # return HeadroomTrackerKF(cfg=tcfg)
 
     raise ValueError(f"Unknown tracker in spec: {tracker_key}")
 
@@ -285,6 +293,9 @@ def _run_one_sequence_worker(job: Dict[str, Any]) -> Dict[str, Any]:
     labels_subdir = str(job.get("labels_subdir", "labels_3d"))
     split_root = str(job.get("split_root", ""))
 
+    global_coords = bool(job.get("global_coords", False))
+    odometry_root = Path(str(job.get("odometry_root", "")))
+
     try:
         # Build tracker instance inside this process
         tracker = _build_tracker_from_spec(tracker_spec)
@@ -296,17 +307,35 @@ def _run_one_sequence_worker(job: Dict[str, Any]) -> Dict[str, Any]:
             gt_json_path = str(Path(split_root) / labels_subdir / f"{seq_name}.json")
             if Path(gt_json_path).exists():
                 gt_by_frame = load_jrdb_labels_3d(gt_json_path)
+        # Load detections
+        dets_by_frame = load_jrdb_detections_3d(str(det_json_path))
 
-        # Run sequence (profiling disabled)
-        tracks_by_frame, stats, _frame_stats = run_tracker_from_detections_json(
+        timestamps_by_frame = None
+
+        if global_coords:
+            # Load odometry for this sequence
+            odo_csv = odometry_root / split_name / "odometry" / f"{seq_name}.csv"
+            pose_by_idx = load_odometry_csv(str(odo_csv))
+
+            # Transform detections and GT into global coordinates
+            dets_by_frame = transform_sequence_to_global(dets_by_frame, pose_by_idx)
+            if gt_by_frame is not None:
+                gt_by_frame = transform_sequence_to_global(dict(gt_by_frame), pose_by_idx)
+
+            # Provide timestamps to tracker if it uses them
+            timestamps_by_frame = build_timestamps_by_frame_from_odometry(str(odo_csv), dets_by_frame)
+
+        tracks_by_frame, stats, frame_stats = run_tracker_on_sequence(
             seq_name=seq_name,
-            detections_json_path=det_json_path,
+            detections_by_frame=dets_by_frame,
             tracker=tracker,
+            frames=None,
             warmup_steps=warmup_steps,
             gt_by_frame=gt_by_frame,
-            timestamps_by_frame=None,
+            timestamps_by_frame=timestamps_by_frame,
             profile=False,
         )
+
 
         # IMPORTANT: provide correct num_frames for aggregate counts in parent
         num_frames = int(getattr(stats, "num_frames", 0))
@@ -344,6 +373,7 @@ def _run_one_sequence_worker(job: Dict[str, Any]) -> Dict[str, Any]:
             "seq_name": seq_name,
             "status": "error",
             "error": repr(e),
+            "traceback": traceback.format_exc(),
             "detections_json": str(det_json_path),
             "out_kitti_txt": out_kitti_txt,
             "frame_stats_csv": "",
@@ -355,6 +385,7 @@ def _run_one_sequence_worker(job: Dict[str, Any]) -> Dict[str, Any]:
             "p99_step_ms": 0.0,
             "total_time_s": 0.0,
         }
+
 
 
 # ----------------------------
@@ -397,6 +428,10 @@ def run_tracker_on_split(
     parallel: bool = False,
     num_workers: int = 0,
     parallel_start_method: str = "spawn",
+
+    # Global coordinate option
+    global_coords: bool = False,
+    odometry_root: Union[str, Path] = "",
 ) -> SplitRunSummary:
     """
     Sequential mode: original behavior (timing + per-frame stats written).
@@ -407,6 +442,13 @@ def run_tracker_on_split(
     det_dir = split_root / detections_subdir
     if not det_dir.exists():
         raise FileNotFoundError(f"Detections directory not found: {det_dir}")
+    
+    global_coords = bool(global_coords)
+    odometry_root = Path(odometry_root) if str(odometry_root) else Path()
+
+    if global_coords and (not str(odometry_root)):
+        raise ValueError("--global_coords requires --odometry_root to be set.")
+
 
     out_root = Path(out_root)
     tracker_dir = out_root / tracker_name / split_name
@@ -587,6 +629,10 @@ def run_tracker_on_split(
                     "split_root": str(split_root),
                     "labels_subdir": str(labels_subdir),
                     "use_gt_if_available": bool(use_gt_if_available),
+
+                    "global_coords": bool(global_coords),
+                    "odometry_root": str(odometry_root),
+
                 }
             )
 
@@ -607,6 +653,12 @@ def run_tracker_on_split(
             try:
                 for fut in concurrent.futures.as_completed(futs):
                     row = fut.result()
+                    if verbose and row.get("status") != "ok":
+                        print(f"[tracker_eval]   ERROR: {row.get('seq_name','')} -> {row.get('error','')}")
+                        tb = row.get("traceback", "")
+                        if tb:
+                            print(tb)
+
                     per_seq_rows.append(row)
 
                     done += 1
