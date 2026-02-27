@@ -1,5 +1,5 @@
 python -m tracker_eval.cli.run_tracker \
-  --split_root /mnt/nvme/JRDB_track/train_val /mnt/nvme/JRDB_track/test \
+  --split_root /mnt/nvme/JRDB_track/train /mnt/nvme/JRDB_track/test \
   --out_root /mnt/nvme/tracker_eval_outputs \
   --tracker elptnet \
   --elptnet_cfg_file /home/scai/trackers/ELPTNet/jrdb.yaml \
@@ -9,7 +9,7 @@ python -m tracker_eval.cli.run_tracker \
 
 
 python -m tracker_eval.cli.run_tracker \
-  --split_root /mnt/nvme/JRDB_track/train_val /mnt/nvme/JRDB_track/test \
+  --split_root /mnt/nvme/JRDB_track/train /mnt/nvme/JRDB_track/test \
   --out_root /mnt/nvme/tracker_eval_outputs \
   --tracker cbmot \
   --cbmot_track_class pedestrian \
@@ -18,7 +18,7 @@ python -m tracker_eval.cli.run_tracker \
 
 
 python -m tracker_eval.cli.run_tracker \
-  --split_root /mnt/nvme/JRDB_track/train_val /mnt/nvme/JRDB_track/test \
+  --split_root /mnt/nvme/JRDB_track/train /mnt/nvme/JRDB_track/test \
   --out_root /mnt/nvme/tracker_eval_outputs \
   --tracker fastpoly \
   --fastpoly_config /home/scai/trackers/FastPoly/config/nusc_config.yaml \
@@ -26,7 +26,7 @@ python -m tracker_eval.cli.run_tracker \
 
 
 python -m tracker_eval.cli.run_tracker \
-  --split_root /mnt/nvme/JRDB_track/train_val /mnt/nvme/JRDB_track/test \
+  --split_root /mnt/nvme/JRDB_track/train /mnt/nvme/JRDB_track/test \
   --out_root /mnt/nvme/tracker_eval_outputs \
   --tracker ab3dmot \
   --ab3dmot_log_dir /mnt/nvme/tracker_eval_outputs/ab3dmot_logs \
@@ -34,7 +34,7 @@ python -m tracker_eval.cli.run_tracker \
 
 
 python -m tracker_eval.cli.run_tracker \
-  --split_root /mnt/nvme/JRDB_track/train_val /mnt/nvme/JRDB_track/test \
+  --split_root /mnt/nvme/JRDB_track/train /mnt/nvme/JRDB_track/test \
   --out_root /mnt/nvme/tracker_eval_outputs \
   --tracker gnnpmb \
   --gnnpmb_parameters_path /home/scai/trackers/GnnPmbTracker/configs/gnnpmb_parameters.json \
@@ -44,7 +44,7 @@ python -m tracker_eval.cli.run_tracker \
 
 
 python -m tracker_eval.cli.run_tracker \
-  --split_root /mnt/nvme/JRDB_track/train_val /mnt/nvme/JRDB_track/test \
+  --split_root /mnt/nvme/JRDB_track/train /mnt/nvme/JRDB_track/test \
   --out_root /mnt/nvme/tracker_eval_outputs \
   --tracker simpletrack \
   --simpletrack_config /home/scai/trackers/SimpleTrack/configs/nu_configs/giou.yaml \
@@ -54,12 +54,14 @@ python -m tracker_eval.cli.run_tracker \
 
 
 python -m tracker_eval.cli.run_all_trackers \
-  --split_root /mnt/nvme/JRDB_track/train_val /mnt/nvme/JRDB_track/test \
+  --split_root /mnt/nvme/JRDB_track/train /mnt/nvme/JRDB_track/test \
   --out_root /mnt/nvme/tracker_eval_outputs \
   --no_skip_existing
 
 
 
-python -m tracker_eval.cli.convert_gt_to_kitti_3d \
-  --split_root /mnt/nvme/JRDB_track/train_val /mnt/nvme/JRDB_track/test \
-  --out_root /mnt/nvme/tracker_eval_outputs
+python -m tracker_eval.cli.convert_gt_to_kitti_3d   --split_root /mnt/nvme/JRDB_track/train /mnt/nvme/JRDB_track/test   --out_root /mnt/nvme/tracker_eval_outputs --global_coords --odometry_root /mnt/nvme/JRDB_track/steamlo_odom
+
+python -m tracker_eval.cli.run_all_trackers --split_root /mnt/nvme/JRDB_track/test --out_root /mnt/nvme/tracker_eval_outputs --tracker_subfolder data --variants_subdir detections_3D_pseudo --variants_from_manifest /mnt/nvme/JRDB_track/test/detections_3D_pseudo/manifest.json --parallel --global_coords --odometry_root /mnt/nvme/JRDB_track/steamlo_odom
+python -m tracker_eval.cli.run_all_trackers --split_root /mnt/nvme/JRDB_track/test --out_root /mnt/nvme/tracker_eval_outputs --tracker_subfolder data --variants_subdir detections_3D_pseudo --variants_from_manifest /mnt/nvme/JRDB_track/test/detections_3D_pseudo/manifest.json --parallel --global_coords --odometry_root /mnt/nvme/JRDB_track/steamlo_odom --no_skip_existing
+python -m tracker_eval.cli.run_all_trackers --split_root /mnt/nvme/JRDB_track/test --out_root /mnt/nvme/tracker_eval_outputs --tracker_subfolder data --global_coords --odometry_root /mnt/nvme/JRDB_track/steamlo_odom --no_skip_existing

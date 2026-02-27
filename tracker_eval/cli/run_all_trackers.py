@@ -12,23 +12,23 @@ TRACKER_ORDER = [
     "headroom",
     "elptnet",
     "cbmot",
-    # "fastpoly",
-     "ab3dmot",
-    #  "gnnpmb",
-    #  "simpletrack",
+    "fastpoly",
+    "ab3dmot",
+    "gnnpmb",
+    "simpletrack",
 ]
 
 # Optional baked-in default per-tracker workers (only used if you want it).
 # Leave as None to not use baked-in defaults.
 # Example:
 DEFAULT_WORKERS_PER_TRACKER = {
-    "headroom": 8,
-    "elptnet": 4,
-    "cbmot": 8,
+    "headroom": 6,
+    "elptnet": 1,
+    "cbmot": 7,
     "fastpoly": 4,
-    "ab3dmot": 4,
-    "gnnpmb": 6,
-    "simpletrack": 8,
+    "ab3dmot": 3,
+    "gnnpmb": 7,
+    "simpletrack": 3,
 }
 # DEFAULT_WORKERS_PER_TRACKER = None
 

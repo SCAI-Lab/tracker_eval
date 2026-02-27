@@ -127,7 +127,12 @@ def transform_frame_data_to_global(
             l=float(b.l),
             w=float(b.w),
             h=float(b.h),
-            rot_z=float(b.rot_z + yaw),
+            # NOTE (JRDB yaw sign fix):
+            # Empirically, JRDB labels/detections in the local (base) frame already rotate with ego motion
+            # as if an ego-compensation was applied with the wrong sign. If we compose yaw "correctly"
+            # (rot_z + ego_yaw), boxes spin/double-rotate when the robot turns.
+            # Therefore we apply the *reverse* composition here: subtract ego yaw.
+            rot_z=float(b.rot_z - yaw),
         )
 
         out_dets.append(

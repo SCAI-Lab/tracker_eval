@@ -529,13 +529,34 @@ def run_tracker_on_split(
                     if verbose:
                         print(f"[tracker_eval]   NOTE: GT not found: {gt_json_path} (running without GT)")
 
-            tracks_by_frame, stats, frame_stats = run_tracker_from_detections_json(
+            # Load detections explicitly (so we can optionally transform)
+            dets_by_frame = load_jrdb_detections_3d(str(det_json_path))
+
+            timestamps_by_frame = None
+            if global_coords:
+                odo_csv = Path(odometry_root) / str(split_name) / "odometry" / f"{seq_name}.csv"
+                if not odo_csv.exists():
+                    raise FileNotFoundError(f"Missing odometry CSV for {seq_name}: {odo_csv}")
+
+                pose_by_idx = load_odometry_csv(str(odo_csv))
+
+                # Transform detections and GT into global coordinates
+                dets_by_frame = transform_sequence_to_global(dets_by_frame, pose_by_idx)
+                if gt_by_frame is not None:
+                    gt_by_frame = transform_sequence_to_global(dict(gt_by_frame), pose_by_idx)
+
+                # Provide timestamps (seconds) derived from odometry CSV
+                timestamps_by_frame = build_timestamps_by_frame_from_odometry(str(odo_csv), dets_by_frame)
+
+            # Run sequence (NOTE: frames=None is OK, because run_tracker_on_sequence unions det+GT keys)
+            tracks_by_frame, stats, frame_stats = run_tracker_on_sequence(
                 seq_name=seq_name,
-                detections_json_path=str(det_json_path),
+                detections_by_frame=dets_by_frame,
                 tracker=tracker,
+                frames=None,
                 warmup_steps=warmup_steps,
                 gt_by_frame=gt_by_frame,
-                timestamps_by_frame=None,
+                timestamps_by_frame=timestamps_by_frame,
                 profile=True,
             )
 

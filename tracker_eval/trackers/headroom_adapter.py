@@ -17,6 +17,7 @@ from tracker_eval.utils import (
     _UnionFind,
     _build_candidates,
     _assign_component_hungarian,
+    _gate_pair_distance_only,
 )
 
 
@@ -595,30 +596,85 @@ class HeadroomAdapter(TrackerBase):
         # ============================================================
         # 1) Assign detections to GT tracks (unchanged)
         # ============================================================
+        # ============================================================
+        # 1) Assign detections to GT tracks (GATE on prediction, COST on GT)
+        # ============================================================
         gt_ids = list(self._gt_tracks.keys())
-        gt_boxes = [self._gt_tracks[gid].out_box for gid in gt_ids]
+
+        # "gate" boxes = what the tracker believes (prediction / filtered state)
+        gt_gate_boxes = [self._gt_tracks[gid].out_box for gid in gt_ids]
+        gt_gate_xy = (
+            np.array([[b.cx, b.cy] for b in gt_gate_boxes], dtype=np.float64)
+            if gt_gate_boxes else np.zeros((0, 2), dtype=np.float64)
+        )
+
+        # "cost" boxes = actual GT at this frame if available, else fall back to gate box
+        gt_cost_boxes = [gt_now.get(gid, self._gt_tracks[gid].out_box) for gid in gt_ids]
+        gt_cost_corners, gt_cost_areas = _precompute_bev_rects(gt_cost_boxes)
+
         gt_miss_dt = np.array([t_now - self._gt_tracks[gid].last_seen_t for gid in gt_ids], dtype=np.float64)
 
-        gt_xy = (
-            np.array([[b.cx, b.cy] for b in gt_boxes], dtype=np.float64)
-            if gt_boxes else np.zeros((0, 2), dtype=np.float64)
-        )
-        gt_corners, gt_areas = _precompute_bev_rects(gt_boxes)
+        # Build sparse candidate edges:
+        #  - neighbor query + dist/z gate are computed on gt_gate_boxes (prediction)
+        #  - dist + iou used in cost are computed on gt_cost_boxes (actual GT when present)
+        gt_edges: List[Tuple[int, int, float, float]] = []
 
-        gt_edges = _build_candidates(
-            cfg,
-            gt_boxes,
-            det_boxes,
-            gt_xy=gt_xy,
-            det_xy=det_xy,
-            gt_corners=gt_corners,
-            gt_areas=gt_areas,
-            det_corners=det_corners,
-            det_areas=det_areas,
-            min_iou=0.0,  # IMPORTANT: tracker should not prune by IoU
-        )
+        nG = len(gt_gate_boxes)
+        nD = len(det_boxes)
+        if nG > 0 and nD > 0:
+            dist_gate = float(cfg.dist_gate_m)
+            topk = int(max(1, cfg.assoc_topk))
+
+            if cKDTree is not None:
+                tree = cKDTree(det_xy)
+                neigh = tree.query_ball_point(gt_gate_xy, r=dist_gate)
+            else:
+                neigh = []
+                r2 = dist_gate ** 2
+                for gi in range(nG):
+                    dx = det_xy[:, 0] - gt_gate_xy[gi, 0]
+                    dy = det_xy[:, 1] - gt_gate_xy[gi, 1]
+                    d2 = dx * dx + dy * dy
+                    idx = np.where(d2 <= r2)[0]
+                    neigh.append(idx.tolist())
+
+            for gi in range(nG):
+                cand_js = neigh[gi]
+                if not cand_js:
+                    continue
+
+                # top-k pruning using gate-space distance (prediction)
+                if len(cand_js) > topk:
+                    dxy = det_xy[np.array(cand_js)] - gt_gate_xy[gi : gi + 1, :]
+                    d2 = np.sum(dxy * dxy, axis=1)
+                    keep = np.argpartition(d2, topk)[:topk]
+                    cand_js = [cand_js[k] for k in keep.tolist()]
+
+                b_gate = gt_gate_boxes[gi]
+                b_cost = gt_cost_boxes[gi]
+
+                for dj in cand_js:
+                    b_det = det_boxes[dj]
+
+                    # gate check uses predicted state
+                    ok, _dist_gate_val = _gate_pair_distance_only(cfg, b_gate, b_det)
+                    if not ok:
+                        continue
+
+                    # cost uses GT state
+                    dx = float(b_cost.cx - b_det.cx)
+                    dy = float(b_cost.cy - b_det.cy)
+                    dist_cost = float(math.sqrt(dx * dx + dy * dy))
+
+                    iou = bev_iou_oriented_cached(
+                        gt_cost_corners[gi], float(gt_cost_areas[gi]),
+                        det_corners[dj], float(det_areas[dj]),
+                    )
+
+                    gt_edges.append((gi, dj, float(iou), float(dist_cost)))
+
         gt_matches_local = _assign_component_hungarian(
-            cfg, len(gt_boxes), len(det_boxes), gt_edges,
+            cfg, len(gt_gate_boxes), len(det_boxes), gt_edges,
             track_miss_dt=gt_miss_dt
         )
 
