@@ -23,6 +23,9 @@ compile_commands.json
 # OS
 .DS_Store
 
+# Jupyter
+.ipynb_checkpoints/
+
 
 *.mp4
 *.avi
