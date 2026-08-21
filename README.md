@@ -1,266 +1,250 @@
 # tracker_eval
 
-Tracker-only inference, export, and runtime-profiling pipeline for **CROWDTRACKBENCH**, a benchmark for **3D LiDAR pedestrian multi-object tracking**.
+`tracker_eval` is a self-contained research pipeline for running seven 3D pedestrian trackers on shared detections, exporting JRDB-compatible trajectories, evaluating them with the bundled corrected TrackEval runtime, computing the RA-L capability protocol, and plotting the saved results.
 
-This repository was used for the experiments in our IROS 2026 benchmark paper. Its role is intentionally focused: it runs trackers on a shared set of per-frame 3D detections, measures tracker-side computational performance, and exports predictions in a format that is directly consumable by the official JRDB evaluation toolkit.
+The repository includes compact evaluation-only runtime subsets of AB3DMOT, CBMOT, ELPTNet, FastPoly, GNN-PMB, SimpleTrack and PedRefTrack.
 
-## What this repository is for
+The general ROS2 implementation of this project's tracker is maintained separately at [Draxran/PedRefTrack](https://github.com/Draxran/PedRefTrack). The implementation here has the same pure-Python core plus a thin benchmark adapter; the separate repository provides the ROS2 `Detection3DArray` node.
 
-`tracker_eval` is designed to evaluate the **tracking stage only** under a shared-detection protocol. In the benchmark setup, all trackers consume the same per-frame 3D pedestrian detections so that differences in results are driven by data association, motion handling, and track lifecycle logic rather than by detector changes.
+## Installation
 
-Concretely, this repository is used to:
+Python 3.10 or newer is required.
 
-- run multiple 3D pedestrian trackers on JRDB detections,
-- profile tracker-step runtime (for example FPS and per-frame latency statistics),
-- export tracker outputs to **JRDB3DBox-compatible KITTI-tracking `.txt` files**, and
-- support controlled stress tests via GT-derived pseudo detections.
-
-This repository is **not** the official accuracy evaluator. For final tracking metrics, we use the official JRDB toolkit:
-
-- `jrdb_toolkit/tracking_eval`: <https://github.com/JRDB-dataset/jrdb_toolkit/tree/main/tracking_eval>
-
-## Benchmark context
-
-The accompanying benchmark paper introduces **CROWDTRACKBENCH** as a reproducible tracker-only benchmark for **3D pedestrian MOT on JRDB** with shared detections, scenario-based analysis, controlled pseudo-detection stress tests, and embedded tracker-step profiling. The primary benchmark metric used in the paper is **HOTA**, while identity stability is analyzed through ID switches and related statistics.
-
-In the paper setup, the benchmark is run on **JRDB**, using shared 3D pedestrian detections and a common export/evaluation convention. This repository implements the tracking, export, and runtime-measurement side of that pipeline.
-
-## Scope of this codebase
-
-At a high level, the pipeline is:
-
-1. Load per-sequence JRDB detections from JSON.
-2. Run one tracker frame by frame.
-3. Enforce evaluation-friendly output conventions such as unique track IDs per frame.
-4. Save predicted trajectories in JRDB3DBox-compatible KITTI-tracking text format.
-5. Save runtime summaries and per-frame timing statistics.
-
-Optional utilities additionally:
-
-- convert JRDB ground truth labels to the same KITTI-style convention,
-- generate GT-derived pseudo detections for robustness studies,
-- build TP/FP score distributions from detections and GT, and
-- visualize predicted tracks against GT as videos.
-
-## Supported trackers
-
-The repository currently supports the following trackers:
-
-- **Headroom**: an in-repo GT-assisted diagnostic reference tracker used to estimate remaining headroom under fixed detections.
-- **AB3DMOT**
-- **FastPoly**
-- **GNN-PMB Tracker**
-- **SimpleTrack**
-- **CBMOT**
-- **ELPTNet** (box-only variant used in the benchmark)
-
-`Headroom` is the only tracker implemented directly in this repository. The other methods are integrated through lightweight adapters that wrap their original open-source implementations into a common tracker interface.
-
-Upstream tracker repositories used in this benchmark:
-
-- AB3DMOT: <https://github.com/xinshuoweng/AB3DMOT>
-- FastPoly: <https://github.com/lixiaoyu2000/FastPoly>
-- GNN-PMB Tracker: <https://github.com/chisyliu/GnnPmbTracker>
-- SimpleTrack: <https://github.com/tusen-ai/SimpleTrack>
-- CBMOT: <https://github.com/cogsys-tuebingen/CBMOT>
-- ELPTNet: <https://github.com/jinzhengguang/ELPTNet>
-
-## Repository structure
-
-```text
-tracker_eval/
-├── cli/
-│   ├── run_tracker.py
-│   ├── run_all_trackers.py
-│   ├── convert_gt_to_kitti_3d.py
-│   ├── generate_pseudo_detections_from_gt.py
-│   ├── build_score_distributions_from_gt_det.py
-│   └── viz_tracks.py
-├── runner/
-│   ├── run_sequence.py
-│   └── run_split.py
-├── data/
-│   └── jrdb_io.py
-├── common/
-│   ├── types.py
-│   └── odometry_transform.py
-├── export/
-│   └── jrdb_kitti_writer.py
-├── trackers/
-│   ├── base.py
-│   ├── headroom_adapter.py
-│   ├── ab3dmot_adapter.py
-│   ├── fastpoly_adapter.py
-│   ├── gnnpmbtracker_adapter.py
-│   ├── simpletrack_adapter.py
-│   ├── cbmot_adapter.py
-│   ├── elptnet_adapter.py
-│   └── headroom_kf_adapter.py
-└── utils.py
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 ```
 
-### Main modules
+For the notebooks, install the optional tools:
 
-- **`trackers/base.py`**  
-  Defines the common tracker interface used throughout the benchmark. Each tracker is reset per sequence and stepped frame by frame, while timing is recorded in a consistent way.
+```bash
+python -m pip install -e '.[notebooks]'
+```
 
-- **`runner/run_sequence.py`**  
-  Core per-sequence execution logic. Runs one tracker on one sequence, computes runtime statistics, and converts outputs into exportable track rows.
+GNN-PMB additionally needs its Murty C++ extension. The repository contains the architecture-neutral source and does not ship the binary.
 
-- **`runner/run_split.py`**  
-  Runs a tracker over a full split, writes KITTI-style outputs, saves per-sequence and aggregate runtime summaries, and optionally supports parallel execution across sequences.
+```bash
+sudo apt install cmake libeigen3-dev
+tracker-eval-build gnnpmb
+```
 
-- **`export/jrdb_kitti_writer.py`**  
-  Converts the repository’s internal box convention into the JRDB3DBox / KITTI-style tracking format expected by the official toolkit.
+The helper performs an out-of-source CMake build with the active Python interpreter and installed `pybind11`, then places `_murty*.so` beside the GNN-PMB package. The generated binary and build directory are ignored by Git.
 
-- **`cli/run_tracker.py`**  
-  Main entry point for running a single tracker over one or more JRDB splits.
+## Included trackers
 
-- **`cli/run_all_trackers.py`**  
-  Convenience wrapper for benchmarking several trackers in one pass.
+| CLI name | Compact runtime included | Authoritative upstream |
+|---|---:|---|
+| `ab3dmot` | yes | [xinshuoweng/AB3DMOT](https://github.com/xinshuoweng/AB3DMOT) |
+| `cbmot` | yes | [cogsys-tuebingen/CBMOT](https://github.com/cogsys-tuebingen/CBMOT) |
+| `elptnet` | yes, box tracker path | [jinzhengguang/ELPTNet](https://github.com/jinzhengguang/ELPTNet) |
+| `fastpoly` | yes | [lixiaoyu2000/FastPoly](https://github.com/lixiaoyu2000/FastPoly) |
+| `gnnpmb` | yes; build Murty once | [chisyliu/GnnPmbTracker](https://github.com/chisyliu/GnnPmbTracker) |
+| `simpletrack` | yes | [tusen-ai/SimpleTrack](https://github.com/tusen-ai/SimpleTrack) |
+| `pedreftrack` | yes | [Draxran/PedRefTrack](https://github.com/Draxran/PedRefTrack) |
 
-- **`cli/convert_gt_to_kitti_3d.py`**  
-  Converts JRDB `labels_3d` JSON files into evaluation-ready KITTI-tracking text files.
+These are compact protocol adapters and required runtime files, not forks intended to replace the upstream projects. Config files used by each adapter are retained in `tracker_eval/trackers/implementations/<tracker>/`.
 
-- **`cli/generate_pseudo_detections_from_gt.py`**  
-  Generates GT-derived pseudo detections for controlled stress tests such as dropout, instability, and confuser cases.
+## Input data layout
 
-- **`cli/build_score_distributions_from_gt_det.py`**  
-  Builds TP/FP score distributions by matching detections to GT; these can be reused when sampling realistic pseudo-detection scores.
-
-- **`cli/viz_tracks.py`**  
-  Visualizes exported predictions and GT in XY/XZ/YZ views and renders MP4 videos.
-
-## Expected data layout
-
-The code assumes a JRDB-style split structure such as:
+Each split is a directory containing one JSON file per sequence:
 
 ```text
 <split_root>/
 ├── detections_3D/
-│   ├── <sequence>.json
-│   └── ...
+│   └── <sequence>.json
 └── labels_3d/
-    ├── <sequence>.json
-    └── ...
+    └── <sequence>.json
 ```
 
-If global-coordinate evaluation is used, odometry is expected under:
+For global-coordinate runs, odometry is read from:
 
 ```text
 <odometry_root>/<split_name>/odometry/<sequence>.csv
 ```
 
-## Output layout
+The CSV columns are `timestamp_ns,x,y,z,qx,qy,qz,qw`. Row `i` is deliberately matched to frame index `i`; timestamps are used as tracker timestamps but not to look up a pose row.
 
-Typical outputs are written under:
+### Detection and source-GT JSON
+
+The accepted top-level detection containers are `detections`, `dets`, or `predictions`. GT accepts `labels`, `annotations`, `frames`, or `data`. A direct frame-to-list mapping is also accepted. Frame keys may be integer-like strings or names such as `000123.pcd`.
+
+```json
+{
+  "detections": {
+    "000000.pcd": [
+      {
+        "box": {
+          "cx": 2.1, "cy": -0.4, "cz": 0.85,
+          "l": 0.5, "w": 0.5, "h": 1.7, "rot_z": 0.0
+        },
+        "score": 0.91,
+        "label_id": "pedestrian:-1"
+      }
+    ]
+  }
+}
+```
+
+`box` may instead be the list `[cx, cy, cz, l, w, h, rot_z]`. The internal convention is a center-based box in metres/radians with x forward, y left, z up, length along x, width along y and yaw about +z. Detection `score` and `label_id` are optional; detections default to track ID `-1`. GT uses `label_id: "pedestrian:<integer>"` as the persistent identity. An explicit integer `track_id` overrides the ID parsed from `label_id`.
+
+`tracker_eval/data/jrdb_io.py` implements this parsing through `load_jrdb_detections_3d`, `load_jrdb_labels_3d` and `_parse_entry_to_detection`.
+
+Ordinary trackers iterate the frame keys present in the detection JSON. GT is loaded only for a tracker that exposes `step_with_gt`; in this repository that is PedRefTrack. PedRefTrack `no_gt` does not use labels, while `gt_assisted` does. Pseudo-detection JSON retains every source GT frame key, including frames whose corruption produces an empty detection list.
+
+### Source GT versus evaluation GT
+
+There are two representations of the same ground truth, not two independent annotations:
+
+1. `labels_3d/<sequence>.json` is the source/runner representation. It is used to generate pseudo detections and only supplied to PedRefTrack in `gt_assisted` mode.
+2. TrackEval consumes KITTI/JRDB text under `<gt_folder>/label_02/<sequence>.txt`, plus `evaluate_tracking.seqmap.<split>`. Generate it from the JSON with `tracker-eval-prepare-gt`.
+
+The output of a tracker is not JSON ground truth; it is the same KITTI/JRDB text convention used by the evaluator. Preparing evaluation GT therefore converts the source JSON without changing the underlying annotations.
+
+## Coordinate and export transforms
+
+The important transforms are centralized and applied identically to detections and source GT:
+
+| Stage | Operation | Implementation |
+|---|---|---|
+| local → global | `p_global = R(q) @ p_local + t` | `transform_box7_local_to_global` in `common/odometry_transform.py` |
+| JRDB yaw compensation | `yaw_global = yaw_local - ego_yaw` | same function; this empirical sign is required by the existing JRDB pipeline |
+| sequence transform | pose row selected by integer frame key | `load_odometry_csv`, `transform_frame_data_to_global`, `transform_sequence_to_global` |
+| internal → TrackEval | `x=-cy`, `y=-cz+h/2`, `z=cx`, `w=w`, `h=h`, `d=l`, `yaw=(-rot_z) mod 2π` | `trackeval_xyzwhd_from_internal_center` in `export/jrdb_kitti_writer.py` |
+
+The odometry CSV is treated as `T_world_sensor`. Global transformation happens in `runner/run_split.py` before a tracker step; `tracker-eval-prepare-gt --global-coords` applies the same transform when building global evaluation GT.
+
+### Tracker output text
+
+`write_sequence_kitti_txt` writes one object per line, sorted by `(frame, track_id)`:
 
 ```text
-<out_root>/
-└── <tracker_name>/
-    └── <split_name>/
-        ├── data/
-        │   ├── <sequence>.txt
-        │   └── ...
-        ├── frame_stats/
-        │   ├── <sequence>.csv
-        │   └── ...
-        ├── runtime_summary.json
-        └── runtime_summary.csv
+frame track_id class truncated occluded alpha x1 y1 x2 y2 x y z w h d yaw [score]
 ```
 
-Where:
+Columns 6–9 are dummy 2D boxes for 3D-only evaluation. Columns 10–16 are the TrackEval `xyzwhd` box after the mapping above. KITTI/JRDB output is mandatory because it is the input to every evaluation path. Duplicate IDs within a frame are rejected.
 
-- `data/*.txt` are the JRDB3DBox-compatible tracking results,
-- `frame_stats/*.csv` store per-frame runtime and load information, and
-- `runtime_summary.*` store aggregate sequence and split-level runtime statistics.
+Tracker runs are saved as:
 
-## Typical workflows
+```text
+<out_root>/<tracker_output_name>/<split_name>/
+├── data/<sequence>.txt
+├── frame_stats/<sequence>.csv
+├── runtime_summary.csv
+└── runtime_summary.json
+```
 
-### 1. Run one tracker
+Sequential mode records real per-frame step timings and is the mode to use for runtime measurements. Parallel mode runs sequences in a shared process pool for throughput; timing and per-frame profiling are intentionally disabled because concurrent workers make those measurements scientifically unreliable.
+
+## Quick pipeline
+
+Run one tracker sequentially (valid runtime statistics):
 
 ```bash
-python -m tracker_eval.cli.run_tracker \
-  --split_root /path/to/JRDB/test \
+tracker-eval \
+  --split_root /data/JRDB/test \
   --split_name test \
-  --out_root /path/to/outputs \
-  --tracker ab3dmot
+  --out_root /data/tracker_outputs \
+  --trackers pedreftrack \
+  --pedreftrack_modes no_gt \
+  --global_coords \
+  --odometry_root /data/JRDB/odometry
 ```
 
-For wrapped trackers, additional tracker-specific configuration files may be required, for example:
-
-- `--simpletrack_config`
-- `--fastpoly_config`
-- `--gnnpmb_parameters_path`
-
-Run `--help` for the full list of tracker-specific arguments.
-
-### 2. Run all trackers
+Run several trackers concurrently (throughput, not timing):
 
 ```bash
-python -m tracker_eval.cli.run_all_trackers \
-  --split_root /path/to/JRDB/test \
+tracker-eval \
+  --split_root /data/JRDB/test \
   --split_name test \
-  --out_root /path/to/outputs
+  --out_root /data/tracker_outputs \
+  --trackers cbmot elptnet fastpoly gnnpmb simpletrack pedreftrack \
+  --parallel --num_workers 12 \
+  --global_coords --odometry_root /data/JRDB/odometry
 ```
 
-### 3. Export ground truth in evaluation format
+Generate all clean/dropout/instability/combined pseudo detections:
 
 ```bash
-python -m tracker_eval.cli.convert_gt_to_kitti_3d \
-  --split_root /path/to/JRDB/test \
+tracker-eval-generate-pseudo \
+  --split_root /data/JRDB/test \
   --split_name test \
-  --out_root /path/to/outputs
+  --odometry_root /data/JRDB/odometry \
+  --spec tracker_eval/cli/pseudo_det_spec.yaml
 ```
 
-### 4. Generate GT-derived pseudo detections
+Run trackers over the manifest conditions:
 
 ```bash
-python -m tracker_eval.cli.generate_pseudo_detections_from_gt \
-  --split_root /path/to/JRDB/test \
-  --spec /path/to/pseudo_detection_spec.yaml
+tracker-eval-pseudo \
+  --manifest /data/JRDB/test/detections_3D_pseudo/manifest.json \
+  --out_root /data/tracker_outputs \
+  --trackers cbmot fastpoly pedreftrack \
+  --pedreftrack_modes no_gt \
+  --parallel --num_workers 12 \
+  --global_coords
 ```
 
-### 5. Build score distributions for pseudo detections
+Pseudo runs use one canonical folder order: `<tracker>__global[_pedreftrack_mode]_<variant>`, for example `fastpoly__global_instability_L1` or `pedreftrack__global_no_gt_clean`. The protocol evaluator preserves these names in its result directory.
+
+Prepare global evaluation GT and evaluate normal tracker outputs:
 
 ```bash
-python -m tracker_eval.cli.build_score_distributions_from_gt_det \
-  --dataset_root /path/to/JRDB \
-  --out_dir /path/to/score_distributions
+tracker-eval-prepare-gt \
+  --labels-dir /data/JRDB/test/labels_3d \
+  --gt-folder /data/eval_gt_global \
+  --split test \
+  --global-coords --odometry-root /data/JRDB/odometry
+
+tracker-eval-evaluate \
+  --gt-folder /data/eval_gt_global \
+  --trackers-folder /data/tracker_outputs \
+  --output-folder /data/evaluation_results \
+  --split test
 ```
 
-### 6. Visualize predictions vs. GT
+Evaluate all pseudo-detection conditions against that same GT:
 
 ```bash
-python -m tracker_eval.cli.viz_tracks \
-  --out_root /path/to/outputs \
-  --tracker ab3dmot \
-  --split_name test \
-  --sequence bytes-cafe-2019-02-07_0 \
-  --out_dir /path/to/videos
+tracker-eval-protocol pseudo \
+  --trackers-dir /data/tracker_outputs \
+  --gt-folder /data/eval_gt_global \
+  --output-dir /data/pseudo_results \
+  --split test --workers 12
 ```
 
-## Notes on evaluation
+Compute the tracker capability tables with one command:
 
-This repository exports predictions in the convention expected by the official JRDB tracking evaluator, but it does **not** replace the evaluator itself. The intended workflow is:
+```bash
+tracker-eval-protocol capabilities \
+  --trackers-base-dir /data/tracker_outputs \
+  --gt-folder /data/eval_gt_global \
+  --local-gt-folder /data/eval_gt_local \
+  --detections-dir /data/JRDB/test/detections_3D \
+  --output-dir /data/protocol_results \
+  --trackers pedreftrack__global_gt_assisted,pedreftrack__global_no_gt,cbmot__global,fastpoly__global \
+  --reference-tracker pedreftrack__global_gt_assisted \
+  --split test --workers 8
+```
 
-1. run tracker inference here,
-2. export predictions to KITTI-style JRDB3DBox files,
-3. run the official JRDB toolkit for final accuracy metrics.
+This command builds/reuses common event caches, per-tracker capability/HOTA caches and final tables. The internal modules are `protocol/hota_cache.py`, `profiles.py` and `results.py`; users should normally call only `tracker-eval-protocol`.
 
-This separation keeps the repository focused on:
+Plot saved results by opening:
 
-- fair tracker-side comparison under shared detections,
-- reproducible runtime profiling, and
-- clean handoff to the official evaluation pipeline.
+- `notebooks/plot_tracker_results.ipynb`
+- `notebooks/plot_pseudo_detection_results.ipynb`
+- `notebooks/ral_visualization_figures_jrdb.ipynb`
 
-## Notes on implementation
+Set the path variables in the first configuration cell, then run all cells. A command-focused walkthrough is in [docs/PIPELINE.md](docs/PIPELINE.md).
 
-- The repository uses a **common tracker interface** so different trackers can be benchmarked through the same runner.
-- Outputs are validated to satisfy **unique track IDs per frame**, which is required by TrackEval / JRDB evaluation.
-- `Headroom` supports GT-assisted tracking logic for diagnostic analysis, while the other trackers are primarily wrapped through adapter classes.
-- Parallel execution is supported for throughput, but detailed timing and per-frame profiling are intentionally disabled in parallel mode.
+## Repository map
 
-## Summary
+```text
+tracker_eval/                  runner, adapters, compact tracker runtimes
+trackeval/                     corrected compact JRDB 3D evaluation runtime
+tracker_eval/protocol/         reusable cache/profile/result stages
+notebooks/                     result and manuscript plotting
+third_party/                   TrackEval license and upstream notice
+```
 
-In short, `tracker_eval` is the repository that powers the **tracker inference and export side of CROWDTRACKBENCH**. It standardizes how multiple open-source 3D pedestrian trackers are run on JRDB detections, how their runtime is measured, and how their outputs are exported for official evaluation.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for upstream references. Project-authored code is MIT licensed; retained third-party files remain under their upstream terms.

@@ -10,7 +10,8 @@ import yaml
 
 from tracker_eval.common.types import Box3D, Detection, FrameData
 from tracker_eval.trackers.base import TrackerBase, TrackerInfo, TrackerRunConfig
-from mot_3d.data_protos import BBox  
+from tracker_eval.trackers.implementations.simpletrack.mot_3d.data_protos import BBox
+from tracker_eval.trackers.paths import SIMPLETRACK_CONFIG
 
 
 @dataclass(frozen=True)
@@ -26,7 +27,7 @@ class SimpleTrackConfig:
       - If you later decide to do minimal tweaks (e.g. score_threshold), do it by editing YAML,
         not via code, to preserve benchmark fairness/reproducibility.
     """
-    config_path: str = "/home/scai/trackers/SimpleTrack/configs/nu_configs/giou.yaml"
+    config_path: str = str(SIMPLETRACK_CONFIG)
 
 
 class SimpleTrackAdapter(TrackerBase):
@@ -97,8 +98,8 @@ class SimpleTrackAdapter(TrackerBase):
 
         # Lazy import so tracker_eval can be imported even without mot_3d installed.
         try:
-            from mot_3d.mot import MOTModel  # type: ignore
-            from mot_3d.frame_data import FrameData as STFrameData  # noqa: F401  # type: ignore
+            from tracker_eval.trackers.implementations.simpletrack.mot_3d.mot import MOTModel
+            from tracker_eval.trackers.implementations.simpletrack.mot_3d.frame_data import FrameData as STFrameData  # noqa: F401
         except Exception as e:
             raise ImportError(
                 "Could not import SimpleTrack (mot_3d). "
@@ -124,7 +125,7 @@ class SimpleTrackAdapter(TrackerBase):
         if self._mot is None or self._configs is None:
             raise RuntimeError("SimpleTrackAdapter: tracker is not initialized. Did you call reset_sequence()?")
 
-        from mot_3d.frame_data import FrameData as STFrameData  # type: ignore
+        from tracker_eval.trackers.implementations.simpletrack.mot_3d.frame_data import FrameData as STFrameData
 
         # IMPORTANT: mot_3d.frame_data.FrameData expects dets as arrays, not BBox objects.
         st_dets: List[np.ndarray] = []

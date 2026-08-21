@@ -4,7 +4,7 @@ import csv
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -82,18 +82,56 @@ def _frame_id_to_int(frame_id: str) -> int:
     return int(s)
 
 
+def _world_from_sensor_terms(
+    pose: Pose,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Return the exact (R, t, yaw) terms used by this package for local->global.
+
+    The package convention is intentionally kept in one function. In
+    particular, JRDB yaw uses the package's empirical
+    ``yaw_global = yaw_local - ego_yaw`` rule rather than standard yaw
+    composition.
+    """
+    qx, qy, qz, qw = (
+        float(pose.q[0]),
+        float(pose.q[1]),
+        float(pose.q[2]),
+        float(pose.q[3]),
+    )
+    R = _quat_to_R(qx, qy, qz, qw)
+    t = pose.t.astype(np.float64, copy=False)
+    yaw = _quat_yaw(qx, qy, qz, qw)
+
+    return R, t, float(yaw)
+
+
+def transform_box7_local_to_global(
+    box7: np.ndarray,
+    pose: Pose,
+) -> np.ndarray:
+    """
+    Transform ``[cx,cy,cz,l,w,h,rot_z]`` with the package's exact convention.
+    """
+    b = np.asarray(box7, dtype=np.float64).reshape(7)
+    R, t, yaw = _world_from_sensor_terms(pose)
+    out = b.copy()
+    out[:3] = (R @ b[:3]) + t
+    # Deliberately non-standard JRDB/package yaw rule. Do not change.
+    out[6] = float(b[6] - yaw)
+    return out
+
+
 def transform_frame_data_to_global(
     fd: FrameData,
     pose_by_frame_idx: Dict[int, Pose],
     *,
     missing_ok: bool = False,
-    invert_pose: bool = False,
 ) -> FrameData:
     """
     Transform all detections in FrameData from local->global using pose for this frame.
 
-    By default assumes pose is T_world_sensor: p_w = R p_s + t.
-    If your CSV is T_sensor_world, set invert_pose=True.
+    The CSV pose is T_world_sensor: p_w = R p_s + t.
     """
     k = _frame_id_to_int(fd.frame_id)
     pose = pose_by_frame_idx.get(k, None)
@@ -102,37 +140,28 @@ def transform_frame_data_to_global(
             return fd
         raise KeyError(f"No odometry pose for frame_idx={k} (frame_id={fd.frame_id})")
 
-    qx, qy, qz, qw = float(pose.q[0]), float(pose.q[1]), float(pose.q[2]), float(pose.q[3])
-    R = _quat_to_R(qx, qy, qz, qw)
-    t = pose.t.astype(np.float64, copy=False)
-    yaw = _quat_yaw(qx, qy, qz, qw)
-
-    if invert_pose:
-        # if CSV is sensor<-world, invert to world<-sensor
-        # R_inv = R^T, t_inv = -R^T t
-        R = R.T
-        t = -R @ t
-        yaw = -yaw
-
     out_dets = []
     for det in fd.dets:
         b: Box3D = det.box
-        p = np.array([b.cx, b.cy, b.cz], dtype=np.float64)
-        pw = (R @ p) + t
+        local_box7 = np.asarray(
+            [b.cx, b.cy, b.cz, b.l, b.w, b.h, b.rot_z],
+            dtype=np.float64,
+        )
+        global_box7 = transform_box7_local_to_global(local_box7, pose)
 
         bw = Box3D(
-            cx=float(pw[0]),
-            cy=float(pw[1]),
-            cz=float(pw[2]),
-            l=float(b.l),
-            w=float(b.w),
-            h=float(b.h),
+            cx=float(global_box7[0]),
+            cy=float(global_box7[1]),
+            cz=float(global_box7[2]),
+            l=float(global_box7[3]),
+            w=float(global_box7[4]),
+            h=float(global_box7[5]),
             # NOTE (JRDB yaw sign fix):
             # Empirically, JRDB labels/detections in the local (base) frame already rotate with ego motion
             # as if an ego-compensation was applied with the wrong sign. If we compose yaw "correctly"
             # (rot_z + ego_yaw), boxes spin/double-rotate when the robot turns.
             # Therefore we apply the *reverse* composition here: subtract ego yaw.
-            rot_z=float(b.rot_z - yaw),
+            rot_z=float(global_box7[6]),
         )
 
         out_dets.append(
@@ -152,12 +181,10 @@ def transform_frame_data_to_global(
 def transform_sequence_to_global(
     data_by_frame: Dict[str, FrameData],
     pose_by_frame_idx: Dict[int, Pose],
-    *,
-    invert_pose: bool = False,
 ) -> Dict[str, FrameData]:
     out: Dict[str, FrameData] = {}
     for fid, fd in data_by_frame.items():
-        out[fid] = transform_frame_data_to_global(fd, pose_by_frame_idx, invert_pose=invert_pose)
+        out[fid] = transform_frame_data_to_global(fd, pose_by_frame_idx)
     return out
 
 

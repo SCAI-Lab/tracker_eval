@@ -27,9 +27,9 @@ class CBMOTConfig:
           - detection_score (float)
           - attribute_name (str)       (not used by tracker logic; we provide placeholder)
 
-      - Matching is done in XY (2D center). It uses 'velocity' as a *back-step* offset:
-            det['tracking'] = np.array(det['velocity'][:2]) * -1 * time_lag
-        so if you don't provide velocity, set it to zeros.
+      - Matching is done in XY. The paper-aligned default uses CBMOT's existing
+        6D Kalman branch with position-only measurements. This avoids treating
+        the adapter's placeholder zero detector velocity as real motion.
 
       - Output tracklets have 'tracking_id' (int), and geometry fields like translation/size/rotation.
     """
@@ -48,6 +48,12 @@ class CBMOTConfig:
     score_update: Optional[str] = None  # None, 'nn', 'addition', 'max', etc.
     model_path: Optional[str] = None
 
+    # Motion/association amendment. `score_decay_per_s`, when set, supersedes
+    # the per-frame `score_decay` without changing its score-update rule.
+    motion_model: str = "KF"           # "KF" or the released "PointTracker"
+    distance_gate_m: float = 0.7
+    score_decay_per_s: Optional[float] = None
+
     # Adapter-level control
     fps: float = 15.0                 # JRDB default; easy to swap for another dataset
     track_class: str = "pedestrian"   # filter + label output; set None-like to track all
@@ -60,8 +66,10 @@ class CBMOTAdapter(TrackerBase):
     """
     Adapter for CBMOT (PubTracker).
 
-    This adapter runs CBMOT in "PointTracker" mode (default in their code),
-    which matches detections to previous tracks using XY distance + per-class thresholds.
+    The paper-aligned default runs the repository's existing 6D XY Kalman
+    branch and uses position-only detector measurements. PointTracker remains
+    selectable for ablations, but it should not be paired with placeholder
+    zero velocities when motion prediction is expected.
 
     We do NOT use:
       - nuScenes sample tokens
@@ -88,6 +96,9 @@ class CBMOTAdapter(TrackerBase):
                     "hungarian": cfg.hungarian,
                     "max_age": cfg.max_age,
                     "min_hits": cfg.min_hits,
+                    "motion_model": cfg.motion_model,
+                    "distance_gate_m": cfg.distance_gate_m,
+                    "score_decay_per_s": cfg.score_decay_per_s,
                     "fps": cfg.fps,
                     "track_class": cfg.track_class,
                 },
@@ -106,12 +117,7 @@ class CBMOTAdapter(TrackerBase):
 
     @staticmethod
     def _lazy_import_pubtracker() -> Any:
-        # If you install CBMOT as a top-level package `cbmot`,
-        # this import becomes: from cbmot.tracker import PubTracker
-        #
-        # If you prefer vendoring CBMOT source inside your repo,
-        # you can adjust this import path accordingly.
-        from cbmot.tracker import PubTracker  # type: ignore
+        from tracker_eval.trackers.implementations.cbmot.tracker import PubTracker
         return PubTracker
 
     # ---------------------------
@@ -265,6 +271,14 @@ class CBMOTAdapter(TrackerBase):
             detection_th=float(self.cfg.detection_th),
             dataset=str(self.cfg.dataset),
             model_path=str(self.cfg.model_path) if self.cfg.model_path is not None else "LeakyReLU.th",
+            motion_model=str(self.cfg.motion_model),
+            use_vel=False,
+            distance_gate_m=float(self.cfg.distance_gate_m),
+            score_decay_per_s=(
+                None
+                if self.cfg.score_decay_per_s is None
+                else float(self.cfg.score_decay_per_s)
+            ),
         )
 
         # Ensure clean state (PubTracker.__init__ calls reset(), but keep explicit)
@@ -306,8 +320,8 @@ class CBMOTAdapter(TrackerBase):
         # Convert dets to CBMOT format
         results = self._detections_to_cbmot_results(detections.dets)
 
-        # CBMOT behavior: if no detections, it clears tracks and returns []
-        # This is fine; we just output empty for that frame.
+        # The amended package predicts and retains eligible tracks on empty
+        # frames instead of clearing the complete tracker state.
         outs = self._tracker.step_centertrack(
             results=results,
             annotated_data=None,

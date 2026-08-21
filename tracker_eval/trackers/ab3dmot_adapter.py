@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 import os
+import sys
 
 import numpy as np
 
@@ -23,7 +25,8 @@ class AB3DMOTConfig:
     min_hits: int = 3
     thresh_3d_iou: float = 0.33
     thresh_3d_dist: float = 0.5
-    metrics: Tuple[str, str] = ("iou_3d", "dist_3d")
+    # metrics: Tuple[str, str] = ("iou_3d", "dist_3d")
+    metrics: Tuple[str, ...] = ("iou_3d", "dist_3d")
     log_dir: Optional[str] = None  # If set, passed to AB3DMOT as a path string
 
 
@@ -120,12 +123,17 @@ class AB3DMOTAdapter(TrackerBase):
         self._seq_name = seq_name
         self._frame_index = 0
 
+        # AB3DMOT original package layout expects AB3DMOT_libs to be top-level.
+        repository_root = Path(__file__).resolve().parents[2]
+        source = repository_root / "tracker_eval" / "trackers" / "implementations" / "ab3dmot"
+        if source.is_dir() and str(source) not in sys.path:
+            sys.path.insert(0, str(source))
+
         try:
             from AB3DMOT_libs.model import AB3DMOT  # type: ignore
         except Exception as e:
             raise ImportError(
                 "Could not import AB3DMOT from 'AB3DMOT_libs.model'. "
-                "Make sure AB3DMOT is installed and available in PYTHONPATH on Jetson."
             ) from e
 
         max_age = int(self.cfg.max_age)

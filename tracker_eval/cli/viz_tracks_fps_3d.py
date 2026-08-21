@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
 
     # TrackEval/JRDB txt inputs
     ap.add_argument("--out_root", required=True, type=str,
-                    help="tracker_eval output root (e.g. /mnt/nvme/tracker_eval_outputs)")
+                    help="tracker_eval output root (e.g. outputs)")
     ap.add_argument("--tracker", required=True, type=str,
                     help="Tracker folder name inside out_root (e.g. fastpoly__global)")
     ap.add_argument("--sequence", required=True, type=str,

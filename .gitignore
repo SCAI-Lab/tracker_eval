@@ -1,5 +1,8 @@
 # Build / install / logs
 build/
+dist/
+*.egg-info/
+.build/
 install/
 log/
 devel/
@@ -7,8 +10,10 @@ devel/
 # Python
 __pycache__/
 *.pyc
+*.so
 .venv/
 venv/
+.pytest_cache/
 
 # CMake
 CMakeFiles/
@@ -26,7 +31,7 @@ compile_commands.json
 # Jupyter
 .ipynb_checkpoints/
 
-
+*.zip
 *.mp4
 *.avi
 *.png

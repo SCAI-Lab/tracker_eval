@@ -1,0 +1,7 @@
+include README.md LICENSE THIRD_PARTY_NOTICES.md
+recursive-include tracker_eval *.yaml *.json LICENSE UPSTREAM_README.md CMakeLists.txt *.cpp *.hpp
+recursive-include trackeval *.py
+recursive-include third_party *
+recursive-include notebooks *.ipynb
+recursive-include docs *.md
+global-exclude __pycache__ *.py[cod] *.so

@@ -9,6 +9,7 @@ import numpy as np
 
 from tracker_eval.common.types import Box3D, Detection, FrameData
 from tracker_eval.trackers.base import TrackerBase, TrackerInfo, TrackerRunConfig
+from tracker_eval.trackers.paths import ELPTNET_CONFIG
 
 
 @dataclass(frozen=True)
@@ -26,25 +27,30 @@ class ELPTnetConfig:
       cfg_file:
         Path to their jrdb.yaml (or equivalent).
       fps:
-        Used only if timestamp_mode="seconds".
+        Detector frequency in hertz. This overrides
+        LiDAR_scanning_frequency from the YAML so ELPTNet's transition matrices
+        and the output-coast conversion use the actual dataset frequency.
       track_class:
         Filter input detections by label. For JRDB, "pedestrian".
       input_score:
         Drop detections with score < input_score before tracking.
       export_score:
         If True, fill Detection.score with 1.0 (ELPTnet online API does not return scores).
-      timestamp_mode:
-        "frame_index" -> timestamp=int(frame_idx)
-        "seconds"     -> timestamp=int(round(frame_idx / fps))  (still int and consecutive-ish)
+      output_coast_s:
+        Maximum duration for emitting ELPTNet's CA predictions after the last
+        detector-supported output. Internal identity retention remains governed
+        by max_prediction_num in the YAML.
+      association_gate_m:
+        Maximum ELPTNet association cost/distance in metres.
     """
-    cfg_file: str = "/home/scai/trackers/ELPTNet/jrdb.yaml"
+    cfg_file: str = str(ELPTNET_CONFIG)
     fps: float = 15.0
 
     track_class: str = "pedestrian"
     input_score: float = 0.5
     export_score: bool = False
-
-    timestamp_mode: str = "frame_index"
+    output_coast_s: float = 0.5
+    association_gate_m: float = 2.0
 
 
 class ELPTnetAdapter(TrackerBase):
@@ -79,7 +85,8 @@ class ELPTnetAdapter(TrackerBase):
                     "fps": cfg.fps,
                     "track_class": cfg.track_class,
                     "input_score": cfg.input_score,
-                    "timestamp_mode": cfg.timestamp_mode,
+                    "output_coast_s": cfg.output_coast_s,
+                    "association_gate_m": cfg.association_gate_m,
                     "box_type": "OpenPCDet",
                 },
             ),
@@ -97,10 +104,9 @@ class ELPTnetAdapter(TrackerBase):
 
     @staticmethod
     def _lazy_imports() -> Dict[str, Any]:
-        # These imports must work after you install ELPTnet repo as a package.
-        from tracker.config import cfg as base_cfg  # type: ignore
-        from tracker.config import cfg_from_yaml_file  # type: ignore
-        from tracker.tracker import Tracker3D  # type: ignore
+        from tracker_eval.trackers.implementations.elptnet.config import cfg as base_cfg
+        from tracker_eval.trackers.implementations.elptnet.config import cfg_from_yaml_file
+        from tracker_eval.trackers.implementations.elptnet.tracker import Tracker3D
 
         return {
             "base_cfg": base_cfg,
@@ -113,17 +119,7 @@ class ELPTnetAdapter(TrackerBase):
     # ---------------------------
 
     def _timestamp_value(self) -> int:
-        """
-        ELPTnet expects consecutive timestamps and frequently uses them as keys.
-        Use int.
-
-        - frame_index: 0,1,2,3,...
-        - seconds:     round(i/fps) but still int; if you want strict consecutive integers,
-                       prefer frame_index. (seconds can repeat if fps is high and rounding).
-        """
-        if self.cfg.timestamp_mode == "seconds":
-            # keep int; but beware: rounding can cause duplicates at high fps.
-            return int(round(float(self._frame_idx) / float(self.cfg.fps)))
+        """Return the consecutive integer timestamp required by ELPTNet."""
         return int(self._frame_idx)
 
     def _detections_to_elpt_boxes(self, dets: List[Detection]) -> np.ndarray:
@@ -163,9 +159,18 @@ class ELPTnetAdapter(TrackerBase):
 
         # Load their config object from YAML into their cfg container
         elp_cfg = cfg_from_yaml_file(self.cfg.cfg_file, base_cfg)
+        if self.cfg.fps <= 0:
+            raise ValueError(f"ELPTnetConfig.fps must be > 0, got {self.cfg.fps}")
+        elp_cfg.LiDAR_scanning_frequency = float(self.cfg.fps)
 
         # IMPORTANT: box_type="OpenPCDet" to avoid their KITTI reordering/conversion.
-        tracker = Tracker3D(box_type="OpenPCDet", tracking_features=False, config=elp_cfg)
+        tracker = Tracker3D(
+            box_type="OpenPCDet",
+            tracking_features=False,
+            config=elp_cfg,
+            output_coast_s=float(self.cfg.output_coast_s),
+            association_gate_m=float(self.cfg.association_gate_m),
+        )
 
         self._elp_cfg = elp_cfg
         self._tracker = tracker

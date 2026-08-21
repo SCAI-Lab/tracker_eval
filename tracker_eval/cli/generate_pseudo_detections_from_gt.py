@@ -1,179 +1,127 @@
-# tracker_eval/cli/generate_pseudo_detections_from_gt.py
+"""Generate the final controlled JRDB pseudo-detection variants.
+
+This contains the standard-GT protocol used in the RA-L analysis: Clean, three
+Dropout levels, three Instability levels, and three symmetric Combined levels.
+Existing variant JSON files are reused only when the previous manifest confirms
+that their generation configuration and GT definition are compatible.
+"""
+
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
-import math
-import zlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import yaml
 
 from tracker_eval.utils import (
-    _seed_u32,
-    _wrap_angle_rad_pi,
+    _box7_from_label_obj,
     _ceil_frames,
     _clip01,
-    _safe_pos,
-    _trunc_normal,
+    _load_labels_3d_json,
     _parse_frame_key,
     _parse_label_id_strict,
-    _box7_from_label_obj,
-    _load_labels_3d_json,
+    _safe_pos,
+    _seed_u32,
     _set_height_keep_bottom,
+    _trunc_normal,
+    _wrap_angle_rad_pi,
 )
 
 
-def _all_frame_keys_from_gt_json(gt_json: Path) -> List[str]:
-    frame_dict = _load_labels_3d_json(gt_json)
-    keys: List[str] = []
-    for k in frame_dict.keys():
-        fr = int(str(k).split(".")[0])
-        keys.append(f"{fr:06d}.pcd")
-    return sorted(keys)
+EXPECTED_VARIANTS = {
+    "clean",
+    "dropout_L1",
+    "dropout_L2",
+    "dropout_L3",
+    "instability_L1",
+    "instability_L2",
+    "instability_L3",
+    "combined_L1",
+    "combined_L2",
+    "combined_L3",
+}
+ALLOWED_MODES = {"clean", "dropout", "instability"}
 
 
-# ============================================================
-# Score distribution loading + sampling
-# ============================================================
+def _split_values(values: Optional[Iterable[str]]) -> List[str]:
+    output: List[str] = []
+    for value in values or []:
+        output.extend(
+            item.strip()
+            for item in str(value).split(",")
+            if item.strip()
+        )
+    return output
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Score sampling
+# ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
-class ScoreDistributions:
-    tp_scores: np.ndarray  # (N,)
-    fp_scores: np.ndarray  # (M,)
+class ScoreDistribution:
+    tp_scores: np.ndarray
 
 
-def _load_score_distributions_json(path: Path) -> ScoreDistributions:
-    """
-    Supports a few reasonable schemas:
-      A) {"tp_scores":[...], "fp_scores":[...]}
-      B) {"scores":{"tp":[...], "fp":[...]}}
-      C) {"tp":[...], "fp":[...]}  (fallback keys)
-    """
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    tp = None
-    fp = None
-
-    if isinstance(data, dict):
-        if "tp_scores" in data and "fp_scores" in data:
-            tp = data.get("tp_scores")
-            fp = data.get("fp_scores")
-        elif "scores" in data and isinstance(data["scores"], dict):
-            tp = data["scores"].get("tp", None)
-            fp = data["scores"].get("fp", None)
+def _load_score_distribution(path: Path) -> ScoreDistribution:
+    suffix = path.suffix.lower()
+    if suffix == ".npz":
+        with np.load(path) as payload:
+            if "tp_scores" not in payload.files:
+                raise ValueError(f"{path} lacks the required 'tp_scores' array")
+            scores = np.asarray(payload["tp_scores"], dtype=np.float32).reshape(-1)
+    elif suffix == ".json":
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Expected a JSON mapping in {path}")
+        if "tp_scores" in payload:
+            raw = payload["tp_scores"]
+        elif isinstance(payload.get("scores"), dict):
+            raw = payload["scores"].get("tp")
         else:
-            # very common fallback
-            tp = data.get("tp", None)
-            fp = data.get("fp", None)
+            raw = payload.get("tp")
+        if raw is None:
+            raise ValueError(f"{path} lacks TP score samples")
+        scores = np.asarray(raw, dtype=np.float32).reshape(-1)
+    else:
+        raise ValueError(f"Unsupported score-distribution file: {path}")
 
-    if tp is None or fp is None:
-        raise ValueError(
-            f"Score distributions JSON missing TP/FP arrays. Got keys={list(data.keys()) if isinstance(data, dict) else type(data)}"
-        )
-
-    tp_arr = np.asarray(tp, dtype=np.float32).reshape(-1)
-    fp_arr = np.asarray(fp, dtype=np.float32).reshape(-1)
-
-    # Keep only finite and clip to [0,1] (your detector is 0.5..1, but be safe)
-    tp_arr = tp_arr[np.isfinite(tp_arr)]
-    fp_arr = fp_arr[np.isfinite(fp_arr)]
-    tp_arr = np.clip(tp_arr, 0.0, 1.0)
-    fp_arr = np.clip(fp_arr, 0.0, 1.0)
-
-    if tp_arr.size == 0 or fp_arr.size == 0:
-        raise ValueError(f"Score distributions are empty after filtering. tp={tp_arr.size}, fp={fp_arr.size}")
-
-    return ScoreDistributions(tp_scores=tp_arr, fp_scores=fp_arr)
-
-def _load_score_distributions_npz(path: Path) -> ScoreDistributions:
-    """
-    Load TP/FP score arrays from .npz written by build_score_distributions_from_gt_det.py
-
-    Expected keys:
-      - tp_scores: (N,)
-      - fp_scores: (M,)
-
-    Other keys may exist (e.g., score_calib_edges/prec/...), ignored here.
-    """
-    try:
-        d = np.load(path)
-    except Exception as e:
-        raise ValueError(f"Failed to load NPZ score distributions: {path} ({e})") from e
-
-    # Validate keys
-    if "tp_scores" not in d.files or "fp_scores" not in d.files:
-        raise ValueError(
-            f"NPZ score distributions missing 'tp_scores'/'fp_scores'. "
-            f"Got keys={d.files} in {path}"
-        )
-
-    tp_arr = np.asarray(d["tp_scores"], dtype=np.float32).reshape(-1)
-    fp_arr = np.asarray(d["fp_scores"], dtype=np.float32).reshape(-1)
-
-    # Keep only finite and clip to [0,1]
-    tp_arr = tp_arr[np.isfinite(tp_arr)]
-    fp_arr = fp_arr[np.isfinite(fp_arr)]
-    tp_arr = np.clip(tp_arr, 0.0, 1.0)
-    fp_arr = np.clip(fp_arr, 0.0, 1.0)
-
-    if tp_arr.size == 0 or fp_arr.size == 0:
-        raise ValueError(
-            f"Score distributions are empty after filtering. "
-            f"tp={tp_arr.size}, fp={fp_arr.size} (from {path})"
-        )
-
-    return ScoreDistributions(tp_scores=tp_arr, fp_scores=fp_arr)
-
-
-def _load_score_distributions(path: Path) -> ScoreDistributions:
-    """
-    Dispatch loader by file extension.
-    Supports:
-      - .json (arrays JSON)
-      - .npz  (from build_score_distributions_from_gt_det.py)
-    """
-    suf = path.suffix.lower()
-    if suf == ".npz":
-        return _load_score_distributions_npz(path)
-    if suf == ".json":
-        return _load_score_distributions_json(path)
-
-    raise ValueError(
-        f"Unsupported score distributions file type: '{path.suffix}' for {path}. "
-        f"Use .json or .npz."
-    )
+    scores = scores[np.isfinite(scores)]
+    scores = np.clip(scores, 0.0, 1.0)
+    if scores.size == 0:
+        raise ValueError(f"No finite TP scores remain in {path}")
+    return ScoreDistribution(tp_scores=scores)
 
 
 class ScoreSampler:
-    """
-    Deterministic score sampler: samples with replacement from TP or FP arrays.
-    """
-    def __init__(self, dists: ScoreDistributions) -> None:
-        self.tp = dists.tp_scores
-        self.fp = dists.fp_scores
+    def __init__(self, distribution: ScoreDistribution) -> None:
+        self._scores = distribution.tp_scores
 
-    @staticmethod
-    def _sample_from(arr: np.ndarray, rng: np.random.Generator) -> float:
-        if arr.size <= 0:
-            return 1.0
-        j = int(rng.integers(0, arr.size))
-        return float(arr[j])
-
-    def sample_tp(self, rng: np.random.Generator) -> float:
-        return self._sample_from(self.tp, rng)
-
-    def sample_fp(self, rng: np.random.Generator) -> float:
-        return self._sample_from(self.fp, rng)
+    def sample(self, rng: np.random.Generator) -> float:
+        index = int(rng.integers(0, self._scores.size))
+        return float(self._scores[index])
 
 
-# ============================================================
-# Corruption config
-# ============================================================
+# ---------------------------------------------------------------------------
+# Variant configuration and corruption models
+# ---------------------------------------------------------------------------
+
 
 @dataclass
 class VariantCfg:
@@ -182,134 +130,117 @@ class VariantCfg:
     class_name: str = "pedestrian"
     severity: float = 1.0
 
-    # -------------------------
-    # 1) Dropout / FN bursts
-    # -------------------------
     dropout_enable: bool = False
     dropout_p_start: float = 0.0
     dropout_min_s: float = 0.0
     dropout_max_s: float = 0.0
 
-    # ----------------------------------------------------
-    # 2) Temporal instability / hypothesis switching
-    # ----------------------------------------------------
     instability_enable: bool = False
     instability_k_modes: int = 3
     instability_p_switch: float = 0.0
-
-    # mode biases (constant while in a mode)
     instability_mode_xy_sigma_m: float = 0.0
     instability_mode_yaw_sigma_rad: float = 0.0
-    instability_mode_lwh_sigma_rel: float = 0.0  # relative: dims *= (1 + rel)
-
-    # per-frame jitter around the chosen mode
+    instability_mode_lwh_sigma_rel: float = 0.0
     instability_jitter_xy_sigma_m: float = 0.0
     instability_jitter_yaw_sigma_rad: float = 0.0
     instability_jitter_lwh_sigma_rel: float = 0.0
-
     instability_p_yaw_random: float = 0.0
 
-    # ----------------------------------------------------
-    # 3) Confuser FP tracklets (moving + static)
-    # ----------------------------------------------------
-    confuser_enable: bool = False
-    confuser_p_start: float = 0.0
-    confuser_min_s: float = 0.0
-    confuser_max_s: float = 0.0
-    confuser_max_active: int = 1
-
-    confuser_p_static: float = 0.0
-
-    # Moving confuser params
-    confuser_offset_xy_mu_m: float = 0.0
-    confuser_offset_xy_sigma_m: float = 0.0
-    confuser_yaw_sigma_rad: float = 0.0
-    confuser_lwh_sigma_rel: float = 0.0
-
-    confuser_jitter_xy_sigma_m: float = 0.0
-    confuser_jitter_yaw_sigma_rad: float = 0.0
-    confuser_jitter_lwh_sigma_rel: float = 0.0
-
-    confuser_p_yaw_random: float = 0.0
-
-    # Static confuser params (0 => fallback to moving)
-    confuser_static_offset_xy_mu_m: float = 0.0
-    confuser_static_offset_xy_sigma_m: float = 0.0
-    confuser_static_yaw_sigma_rad: float = 0.0
-    confuser_static_lwh_sigma_rel: float = 0.0
-
-    confuser_static_jitter_xy_sigma_m: float = 0.0
-    confuser_static_jitter_yaw_sigma_rad: float = 0.0
-    confuser_static_jitter_lwh_sigma_rel: float = 0.0
-
-    confuser_static_p_yaw_random: float = 0.0
-
-    confuser_only_when_primary_present: bool = True
-
-    # -------------------------
-    # Score handling
-    # -------------------------
-    # Backwards compatible: used when score_mode == "constant" or no sampler provided.
     score_value: float = 1.0
-
-    # New: "sample" or "constant"
     score_mode: str = "constant"
-
-    # Optional: path in YAML; can be overridden by CLI
     score_dists: str = ""
 
+    dropout_level: str = ""
+    instability_level: str = ""
 
-def _apply_severity_once(cfg_in: VariantCfg) -> VariantCfg:
-    """
-    Returns a NEW VariantCfg with severity applied exactly once.
-    (Does not mutate input.)
-    """
-    cfg = VariantCfg(**cfg_in.__dict__)
-    s = float(cfg.severity)
 
-    # probabilities scale (clipped)
-    cfg.dropout_p_start = _clip01(cfg.dropout_p_start * s)
-    cfg.instability_p_switch = _clip01(cfg.instability_p_switch * s)
-    cfg.instability_p_yaw_random = _clip01(cfg.instability_p_yaw_random * s)
+def _variant_cfg_from_dict(
+    name: str,
+    base: Mapping[str, Any],
+    override: Mapping[str, Any],
+) -> VariantCfg:
+    merged = dict(base)
+    merged.update(dict(override))
+    cfg = VariantCfg(
+        name=name,
+        fps=float(merged.get("fps", 15.0)),
+        class_name=str(merged.get("class_name", "pedestrian")),
+        severity=float(merged.get("severity", 1.0)),
+        dropout_enable=bool(merged.get("dropout_enable", False)),
+        dropout_p_start=float(merged.get("dropout_p_start", 0.0)),
+        dropout_min_s=float(merged.get("dropout_min_s", 0.0)),
+        dropout_max_s=float(merged.get("dropout_max_s", 0.0)),
+        instability_enable=bool(merged.get("instability_enable", False)),
+        instability_k_modes=int(merged.get("instability_k_modes", 3)),
+        instability_p_switch=float(merged.get("instability_p_switch", 0.0)),
+        instability_mode_xy_sigma_m=float(
+            merged.get("instability_mode_xy_sigma_m", 0.0)
+        ),
+        instability_mode_yaw_sigma_rad=float(
+            merged.get("instability_mode_yaw_sigma_rad", 0.0)
+        ),
+        instability_mode_lwh_sigma_rel=float(
+            merged.get("instability_mode_lwh_sigma_rel", 0.0)
+        ),
+        instability_jitter_xy_sigma_m=float(
+            merged.get("instability_jitter_xy_sigma_m", 0.0)
+        ),
+        instability_jitter_yaw_sigma_rad=float(
+            merged.get("instability_jitter_yaw_sigma_rad", 0.0)
+        ),
+        instability_jitter_lwh_sigma_rel=float(
+            merged.get("instability_jitter_lwh_sigma_rel", 0.0)
+        ),
+        instability_p_yaw_random=float(
+            merged.get("instability_p_yaw_random", 0.0)
+        ),
+        score_value=float(merged.get("score_value", 1.0)),
+        score_mode=str(merged.get("score_mode", "constant")),
+        score_dists=str(merged.get("score_dists", "")),
+        dropout_level=str(merged.get("dropout_level", "")),
+        instability_level=str(merged.get("instability_level", "")),
+    )
 
-    cfg.confuser_p_start = _clip01(cfg.confuser_p_start * s)
-    cfg.confuser_p_yaw_random = _clip01(cfg.confuser_p_yaw_random * s)
-    cfg.confuser_p_static = _clip01(cfg.confuser_p_static)  # ratio, not severity-scaled
-    cfg.confuser_static_p_yaw_random = _clip01(cfg.confuser_static_p_yaw_random * s)
+    cfg.dropout_p_start = _clip01(cfg.dropout_p_start)
+    cfg.instability_p_switch = _clip01(cfg.instability_p_switch)
+    cfg.instability_p_yaw_random = _clip01(cfg.instability_p_yaw_random)
+    cfg.instability_k_modes = max(1, cfg.instability_k_modes)
+    cfg.score_mode = cfg.score_mode.strip().lower() or "constant"
 
-    # magnitudes scale
-    cfg.instability_mode_xy_sigma_m *= s
-    cfg.instability_mode_yaw_sigma_rad *= s
-    cfg.instability_mode_lwh_sigma_rel *= s
-    cfg.instability_jitter_xy_sigma_m *= s
-    cfg.instability_jitter_yaw_sigma_rad *= s
-    cfg.instability_jitter_lwh_sigma_rel *= s
-
-    cfg.confuser_offset_xy_mu_m *= s
-    cfg.confuser_offset_xy_sigma_m *= s
-    cfg.confuser_yaw_sigma_rad *= s
-    cfg.confuser_lwh_sigma_rel *= s
-    cfg.confuser_jitter_xy_sigma_m *= s
-    cfg.confuser_jitter_yaw_sigma_rad *= s
-    cfg.confuser_jitter_lwh_sigma_rel *= s
-
-    cfg.confuser_static_offset_xy_mu_m *= s
-    cfg.confuser_static_offset_xy_sigma_m *= s
-    cfg.confuser_static_yaw_sigma_rad *= s
-    cfg.confuser_static_lwh_sigma_rel *= s
-    cfg.confuser_static_jitter_xy_sigma_m *= s
-    cfg.confuser_static_jitter_yaw_sigma_rad *= s
-    cfg.confuser_static_jitter_lwh_sigma_rel *= s
-
-    cfg.instability_k_modes = max(1, int(cfg.instability_k_modes))
-    cfg.confuser_max_active = max(0, int(cfg.confuser_max_active))
-    cfg.score_mode = str(cfg.score_mode).strip().lower() or "constant"
+    if cfg.fps <= 0.0:
+        raise ValueError(f"{name}: fps must be positive")
+    if cfg.score_mode not in {"constant", "sample"}:
+        raise ValueError(f"{name}: score_mode must be 'constant' or 'sample'")
+    if cfg.instability_p_yaw_random != 0.0:
+        raise ValueError(
+            f"{name}: random yaw replacement is not part of the retained protocol"
+        )
+    if cfg.dropout_enable:
+        if cfg.dropout_p_start <= 0.0:
+            raise ValueError(f"{name}: dropout_p_start must be positive")
+        if cfg.dropout_min_s < 0.0 or cfg.dropout_max_s < cfg.dropout_min_s:
+            raise ValueError(f"{name}: invalid dropout duration interval")
     return cfg
 
 
-# ============================================================
-# Failure mode models
-# ============================================================
+def _apply_severity_once(cfg_in: VariantCfg) -> VariantCfg:
+    cfg = VariantCfg(**asdict(cfg_in))
+    severity = float(cfg.severity)
+    cfg.dropout_p_start = _clip01(cfg.dropout_p_start * severity)
+    cfg.instability_p_switch = _clip01(
+        cfg.instability_p_switch * severity
+    )
+    cfg.instability_p_yaw_random = _clip01(
+        cfg.instability_p_yaw_random * severity
+    )
+    cfg.instability_mode_xy_sigma_m *= severity
+    cfg.instability_mode_yaw_sigma_rad *= severity
+    cfg.instability_mode_lwh_sigma_rel *= severity
+    cfg.instability_jitter_xy_sigma_m *= severity
+    cfg.instability_jitter_yaw_sigma_rad *= severity
+    cfg.instability_jitter_lwh_sigma_rel *= severity
+    return cfg
+
 
 def _make_dropout_keep_mask(
     frames: np.ndarray,
@@ -319,35 +250,21 @@ def _make_dropout_keep_mask(
     max_s: float,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """
-    Bursty dropout:
-      each frame, with prob p_start start a dropout burst of duration U[min_s,max_s] seconds.
-    """
     n = int(frames.shape[0])
-    keep = np.ones((n,), dtype=bool)
-    if n == 0:
+    keep = np.ones(n, dtype=bool)
+    if n == 0 or p_start <= 0.0 or max_s <= 0.0:
         return keep
 
-    p_start = _clip01(p_start)
-    if p_start <= 0.0 or max_s <= 0.0:
-        return keep
-
-    min_k = _ceil_frames(min_s, fps)
-    max_k = _ceil_frames(max_s, fps)
-    max_k = max(min_k, max_k)
-
+    minimum = _ceil_frames(min_s, fps)
+    maximum = max(minimum, _ceil_frames(max_s, fps))
     dropout_until = -10**9
-    for i, fr in enumerate(frames.tolist()):
-        if fr <= dropout_until:
-            keep[i] = False
-            continue
-
-        if rng.random() < p_start:
-            dur = int(rng.integers(min_k, max_k + 1))
-            dropout_until = fr + dur - 1
-            keep[i] = False
-        else:
-            keep[i] = True
+    for index, frame in enumerate(frames.tolist()):
+        if frame <= dropout_until:
+            keep[index] = False
+        elif rng.random() < _clip01(p_start):
+            duration = int(rng.integers(minimum, maximum + 1))
+            dropout_until = int(frame) + duration - 1
+            keep[index] = False
     return keep
 
 
@@ -357,722 +274,729 @@ def _apply_instability_hypothesis_switching(
     cfg: VariantCfg,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """
-    Primary stream: one detection per GT frame (before dropout),
-    using K hypotheses (modes) with Markov switching.
-
-    Internal box7: (cx,cy,cz,l,w,h,rot_z)
-    """
     boxes = gt_boxes.astype(np.float32).copy()
     n = int(frames.shape[0])
     if n == 0 or not cfg.instability_enable:
         return boxes
 
-    K = max(1, int(cfg.instability_k_modes))
-    p_switch = _clip01(cfg.instability_p_switch)
+    modes = max(1, int(cfg.instability_k_modes))
+    switch_probability = _clip01(cfg.instability_p_switch)
+    mode_xy = _trunc_normal(
+        rng,
+        0.0,
+        float(cfg.instability_mode_xy_sigma_m),
+        size=(modes, 2),
+        n_sigma=2.0,
+    ).astype(np.float32, copy=False)
+    mode_yaw = _trunc_normal(
+        rng,
+        0.0,
+        float(cfg.instability_mode_yaw_sigma_rad),
+        size=(modes,),
+        n_sigma=2.0,
+    ).astype(np.float32, copy=False)
+    mode_lwh = _trunc_normal(
+        rng,
+        0.0,
+        float(cfg.instability_mode_lwh_sigma_rel),
+        size=(modes, 3),
+        n_sigma=2.0,
+    ).astype(np.float32, copy=False)
+    mode_index = int(rng.integers(0, modes))
 
-    # Mode biases: sampled once per track (TRUNCATED to ±2σ for plausibility)
-    mode_xy = _trunc_normal(rng, 0.0, float(cfg.instability_mode_xy_sigma_m), size=(K, 2), n_sigma=2.0).astype(np.float32, copy=False)
-    mode_yaw = _trunc_normal(rng, 0.0, float(cfg.instability_mode_yaw_sigma_rad), size=(K,), n_sigma=2.0).astype(np.float32, copy=False)
-    mode_lwh_rel = _trunc_normal(rng, 0.0, float(cfg.instability_mode_lwh_sigma_rel), size=(K, 3), n_sigma=2.0).astype(np.float32, copy=False)
+    for index in range(n):
+        if (
+            index > 0
+            and modes > 1
+            and rng.random() < switch_probability
+        ):
+            new_index = int(rng.integers(0, modes - 1))
+            if new_index >= mode_index:
+                new_index += 1
+            mode_index = new_index
 
-    mode_idx = int(rng.integers(0, K))
+        boxes[index, 0] += float(mode_xy[mode_index, 0])
+        boxes[index, 1] += float(mode_xy[mode_index, 1])
+        boxes[index, 6] = _wrap_angle_rad_pi(
+            float(boxes[index, 6]) + float(mode_yaw[mode_index])
+        )
 
-    for i in range(n):
-        if i > 0 and (rng.random() < p_switch) and K > 1:
-            j = int(rng.integers(0, K - 1))
-            if j >= mode_idx:
-                j += 1
-            mode_idx = j
+        relative = mode_lwh[mode_index]
+        boxes[index, 3] = _safe_pos(
+            float(boxes[index, 3]) * (1.0 + float(relative[0]))
+        )
+        boxes[index, 4] = _safe_pos(
+            float(boxes[index, 4]) * (1.0 + float(relative[1]))
+        )
+        height = _safe_pos(
+            float(boxes[index, 5]) * (1.0 + float(relative[2]))
+        )
+        _set_height_keep_bottom(boxes[index], height)
 
-        bxy = mode_xy[mode_idx]
-        byaw = float(mode_yaw[mode_idx])
-        blwh = mode_lwh_rel[mode_idx]
-
-        # Apply mode bias
-        boxes[i, 0] += float(bxy[0])
-        boxes[i, 1] += float(bxy[1])
-        boxes[i, 6] = _wrap_angle_rad_pi(float(boxes[i, 6]) + byaw)
-
-        # Apply size mode bias (relative) with bottom-fixed height handling
-        new_l = _safe_pos(float(boxes[i, 3]) * (1.0 + float(blwh[0])))
-        new_w = _safe_pos(float(boxes[i, 4]) * (1.0 + float(blwh[1])))
-        new_h = _safe_pos(float(boxes[i, 5]) * (1.0 + float(blwh[2])))
-
-        boxes[i, 3] = float(new_l)
-        boxes[i, 4] = float(new_w)
-        _set_height_keep_bottom(boxes[i], float(new_h))
-
-        # Per-frame jitter
         if cfg.instability_jitter_xy_sigma_m > 0.0:
-            boxes[i, 0] += float(_trunc_normal(rng, 0.0, float(cfg.instability_jitter_xy_sigma_m), size=(), n_sigma=2.0))
-            boxes[i, 1] += float(_trunc_normal(rng, 0.0, float(cfg.instability_jitter_xy_sigma_m), size=(), n_sigma=2.0))
-
-        if cfg.instability_jitter_lwh_sigma_rel > 0.0:
-            jlwh = _trunc_normal(rng, 0.0, float(cfg.instability_jitter_lwh_sigma_rel), size=(3,), n_sigma=2.0).astype(np.float32, copy=False)
-            boxes[i, 3] = _safe_pos(float(boxes[i, 3]) * (1.0 + float(jlwh[0])))
-            boxes[i, 4] = _safe_pos(float(boxes[i, 4]) * (1.0 + float(jlwh[1])))
-
-            new_h2 = _safe_pos(float(boxes[i, 5]) * (1.0 + float(jlwh[2])))
-            _set_height_keep_bottom(boxes[i], float(new_h2))
-
-        if cfg.instability_p_yaw_random > 0.0 and (rng.random() < float(cfg.instability_p_yaw_random)):
-            boxes[i, 6] = _wrap_angle_rad_pi(float(rng.uniform(-math.pi, math.pi)))
-        elif cfg.instability_jitter_yaw_sigma_rad > 0.0:
-            boxes[i, 6] = _wrap_angle_rad_pi(
-                float(boxes[i, 6]) + float(_trunc_normal(rng, 0.0, float(cfg.instability_jitter_yaw_sigma_rad), size=(), n_sigma=2.0))
+            boxes[index, 0] += float(
+                _trunc_normal(
+                    rng,
+                    0.0,
+                    cfg.instability_jitter_xy_sigma_m,
+                    size=(),
+                    n_sigma=2.0,
+                )
             )
-
-    return boxes.astype(np.float32)
-
-
-def _sample_offset_xy(mu: float, sigma: float, rng: np.random.Generator) -> Tuple[float, float]:
-    """
-    Sample an offset vector with magnitude ~ N(mu, sigma) folded to >=0,
-    direction uniform.
-
-    Magnitude sampling is truncated to ±2σ (then abs).
-    """
-    mu = float(mu)
-    sigma = float(sigma)
-    if sigma > 0.0:
-        mag = float(abs(_trunc_normal(rng, mu, sigma, size=(), n_sigma=2.0)))
-    else:
-        mag = float(abs(mu))
-    ang = float(rng.uniform(-math.pi, math.pi))
-    return mag * math.cos(ang), mag * math.sin(ang)
-
-
-@dataclass
-class _ActiveConfuser:
-    end_frame: int
-    kind: str  # "moving" or "static"
-    bias_xy: Tuple[float, float]
-    bias_yaw: float
-    bias_lwh_rel: Tuple[float, float, float]
-    static_anchor_xy: Optional[Tuple[float, float]] = None
-
-
-def _emit_confuser_tracklets_for_track(
-    frames: np.ndarray,
-    gt_boxes: np.ndarray,
-    primary_keep: np.ndarray,
-    cfg: VariantCfg,
-    rng: np.random.Generator,
-) -> Dict[int, List[np.ndarray]]:
-    """
-    Generate confuser FP tracklets near the GT track.
-    Returns dict: frame_int -> list of box7.
-    """
-    out: Dict[int, List[np.ndarray]] = {}
-    n = int(frames.shape[0])
-    if n == 0 or not cfg.confuser_enable or cfg.confuser_p_start <= 0.0 or cfg.confuser_max_active <= 0:
-        return out
-
-    fps = float(cfg.fps)
-    min_k = _ceil_frames(cfg.confuser_min_s, fps) if cfg.confuser_max_s > 0.0 else 1
-    max_k = _ceil_frames(cfg.confuser_max_s, fps) if cfg.confuser_max_s > 0.0 else 1
-    max_k = max(min_k, max_k)
-
-    active: List[_ActiveConfuser] = []
-
-    def _pick_static_param(v_static: float, v_moving: float) -> float:
-        return float(v_static) if float(v_static) != 0.0 else float(v_moving)
-
-    for i in range(n):
-        fr = int(frames[i])
-
-        # retire expired
-        active = [a for a in active if fr <= a.end_frame]
-
-        # optionally only emit/start when primary is present
-        if cfg.confuser_only_when_primary_present and not bool(primary_keep[i]):
-            continue
-
-        # start new confuser tracklet?
-        if (len(active) < int(cfg.confuser_max_active)) and (rng.random() < float(cfg.confuser_p_start)):
-            dur = int(rng.integers(min_k, max_k + 1))
-            end_fr = fr + dur - 1
-
-            is_static = (rng.random() < float(cfg.confuser_p_static))
-            kind = "static" if is_static else "moving"
-
-            if kind == "moving":
-                off_mu = float(cfg.confuser_offset_xy_mu_m)
-                off_sig = float(cfg.confuser_offset_xy_sigma_m)
-                yaw_sig = float(cfg.confuser_yaw_sigma_rad)
-                lwh_sig = float(cfg.confuser_lwh_sigma_rel)
-            else:
-                off_mu = _pick_static_param(cfg.confuser_static_offset_xy_mu_m, cfg.confuser_offset_xy_mu_m)
-                off_sig = _pick_static_param(cfg.confuser_static_offset_xy_sigma_m, cfg.confuser_offset_xy_sigma_m)
-                yaw_sig = _pick_static_param(cfg.confuser_static_yaw_sigma_rad, cfg.confuser_yaw_sigma_rad)
-                lwh_sig = _pick_static_param(cfg.confuser_static_lwh_sigma_rel, cfg.confuser_lwh_sigma_rel)
-
-            bx, by = _sample_offset_xy(off_mu, off_sig, rng)
-            byaw = float(_trunc_normal(rng, 0.0, yaw_sig, size=(), n_sigma=2.0)) if yaw_sig > 0.0 else 0.0
-
-            if lwh_sig > 0.0:
-                blwh = _trunc_normal(rng, 0.0, lwh_sig, size=(3,), n_sigma=2.0).astype(np.float32, copy=False)
-                bias_lwh = (float(blwh[0]), float(blwh[1]), float(blwh[2]))
-            else:
-                bias_lwh = (0.0, 0.0, 0.0)
-
-            static_anchor_xy: Optional[Tuple[float, float]] = None
-            if kind == "static":
-                gt = gt_boxes[i].astype(np.float32)
-                static_anchor_xy = (float(gt[0]) + float(bx), float(gt[1]) + float(by))
-
-            active.append(
-                _ActiveConfuser(
-                    end_frame=end_fr,
-                    kind=kind,
-                    bias_xy=(bx, by),
-                    bias_yaw=byaw,
-                    bias_lwh_rel=bias_lwh,
-                    static_anchor_xy=static_anchor_xy,
+            boxes[index, 1] += float(
+                _trunc_normal(
+                    rng,
+                    0.0,
+                    cfg.instability_jitter_xy_sigma_m,
+                    size=(),
+                    n_sigma=2.0,
                 )
             )
 
-        if not active:
-            continue
+        if cfg.instability_jitter_lwh_sigma_rel > 0.0:
+            jitter = _trunc_normal(
+                rng,
+                0.0,
+                cfg.instability_jitter_lwh_sigma_rel,
+                size=(3,),
+                n_sigma=2.0,
+            ).astype(np.float32, copy=False)
+            boxes[index, 3] = _safe_pos(
+                float(boxes[index, 3]) * (1.0 + float(jitter[0]))
+            )
+            boxes[index, 4] = _safe_pos(
+                float(boxes[index, 4]) * (1.0 + float(jitter[1]))
+            )
+            height = _safe_pos(
+                float(boxes[index, 5]) * (1.0 + float(jitter[2]))
+            )
+            _set_height_keep_bottom(boxes[index], height)
 
-        gt = gt_boxes[i].astype(np.float32)
-        cx, cy, cz, l, w, h, rot_z = [float(v) for v in gt.tolist()]
-
-        for a in active:
-            b = gt.copy()
-
-            if a.kind == "moving":
-                b[0] = cx + float(a.bias_xy[0])
-                b[1] = cy + float(a.bias_xy[1])
-
-                jitter_xy = float(cfg.confuser_jitter_xy_sigma_m)
-                jitter_yaw = float(cfg.confuser_jitter_yaw_sigma_rad)
-                jitter_lwh = float(cfg.confuser_jitter_lwh_sigma_rel)
-                p_yaw_rand = float(cfg.confuser_p_yaw_random)
-            else:
-                ax, ay = a.static_anchor_xy if a.static_anchor_xy is not None else (cx, cy)
-                b[0] = float(ax)
-                b[1] = float(ay)
-
-                jitter_xy = _pick_static_param(cfg.confuser_static_jitter_xy_sigma_m, cfg.confuser_jitter_xy_sigma_m)
-                jitter_yaw = _pick_static_param(cfg.confuser_static_jitter_yaw_sigma_rad, cfg.confuser_jitter_yaw_sigma_rad)
-                jitter_lwh = _pick_static_param(cfg.confuser_static_jitter_lwh_sigma_rel, cfg.confuser_jitter_lwh_sigma_rel)
-                p_yaw_rand = float(cfg.confuser_static_p_yaw_random) if float(cfg.confuser_static_p_yaw_random) != 0.0 else float(cfg.confuser_p_yaw_random)
-
-            # yaw: random with prob, else biased + jitter (jitter applies on non-random-yaw frames)
-            if p_yaw_rand > 0.0 and (rng.random() < p_yaw_rand):
-                b[6] = _wrap_angle_rad_pi(float(rng.uniform(-math.pi, math.pi)))
-            else:
-                b[6] = _wrap_angle_rad_pi(rot_z + float(a.bias_yaw))
-                if jitter_yaw > 0.0:
-                    b[6] = _wrap_angle_rad_pi(
-                        float(b[6]) + float(_trunc_normal(rng, 0.0, float(jitter_yaw), size=(), n_sigma=2.0))
+        if cfg.instability_jitter_yaw_sigma_rad > 0.0:
+            boxes[index, 6] = _wrap_angle_rad_pi(
+                float(boxes[index, 6])
+                + float(
+                    _trunc_normal(
+                        rng,
+                        0.0,
+                        cfg.instability_jitter_yaw_sigma_rad,
+                        size=(),
+                        n_sigma=2.0,
                     )
-
-            # size bias (relative) with bottom-fixed height
-            new_l = _safe_pos(l * (1.0 + float(a.bias_lwh_rel[0])))
-            new_w = _safe_pos(w * (1.0 + float(a.bias_lwh_rel[1])))
-            new_h = _safe_pos(h * (1.0 + float(a.bias_lwh_rel[2])))
-
-            b[3] = float(new_l)
-            b[4] = float(new_w)
-            _set_height_keep_bottom(b, float(new_h))
-
-            # per-frame jitter
-            if jitter_xy > 0.0:
-                b[0] += float(_trunc_normal(rng, 0.0, float(jitter_xy), size=(), n_sigma=2.0))
-                b[1] += float(_trunc_normal(rng, 0.0, float(jitter_xy), size=(), n_sigma=2.0))
-
-            if jitter_lwh > 0.0:
-                jlwh = _trunc_normal(rng, 0.0, float(jitter_lwh), size=(3,), n_sigma=2.0).astype(np.float32, copy=False)
-                b[3] = _safe_pos(float(b[3]) * (1.0 + float(jlwh[0])))
-                b[4] = _safe_pos(float(b[4]) * (1.0 + float(jlwh[1])))
-                new_h2 = _safe_pos(float(b[5]) * (1.0 + float(jlwh[2])))
-                _set_height_keep_bottom(b, float(new_h2))
-
-            out.setdefault(fr, []).append(b.astype(np.float32))
-
-    return out
+                )
+            )
+    return boxes.astype(np.float32)
 
 
-# ============================================================
-# Output structure: per-frame detections with scores
-# ============================================================
+# ---------------------------------------------------------------------------
+# GT loading and detector-schema output
+# ---------------------------------------------------------------------------
 
-@dataclass
-class _DetRow:
+
+@dataclass(frozen=True)
+class SequenceData:
+    name: str
+    frame_keys: Tuple[str, ...]
+    by_track: Dict[int, Tuple[np.ndarray, np.ndarray]]
+
+
+@dataclass(frozen=True)
+class DetectionRow:
     box7: np.ndarray
     score: float
 
 
-def _sample_primary_score(cfg: VariantCfg, sampler: Optional[ScoreSampler], rng_score: np.random.Generator) -> float:
-    if cfg.score_mode == "sample" and sampler is not None:
-        return float(sampler.sample_tp(rng_score))
-    return float(cfg.score_value)
+def _load_sequence(path: Path, class_name: str) -> SequenceData:
+    frame_dict = _load_labels_3d_json(path)
+    by_track_rows: Dict[int, List[Tuple[int, np.ndarray]]] = {}
+    canonical_keys: List[str] = []
 
-
-def _sample_confuser_score(cfg: VariantCfg, sampler: Optional[ScoreSampler], rng_score: np.random.Generator) -> float:
-    if cfg.score_mode == "sample" and sampler is not None:
-        return float(sampler.sample_fp(rng_score))
-    return float(cfg.score_value)
-
-
-def _generate_pseudo_boxes_by_frame(
-    gt_by_tid: Dict[int, Tuple[np.ndarray, np.ndarray]],
-    cfg: VariantCfg,  # severity already applied once
-    rng_seed_base: int,
-    variant_name: str,
-    seq_name: str,
-    score_sampler: Optional[ScoreSampler],
-) -> Dict[str, List[_DetRow]]:
-    """
-    Returns: frame_key(str like '000123.pcd') -> list of _DetRow(box7, score)
-
-    Score policy:
-      - Primary detections (GT-derived): sample from TP distribution
-      - Confusers (FP tracklets): sample from FP distribution
-    """
-    out_by_frame: Dict[str, List[_DetRow]] = {}
-
-    for tid, (frames, gt_boxes) in gt_by_tid.items():
-        # Geometry RNG (existing behavior)
-        rng = np.random.default_rng(_seed_u32(rng_seed_base, variant_name, seq_name, "tid", int(tid), "geom"))
-
-        # Separate RNG stream for scores (keeps determinism stable even if geom logic changes a bit)
-        rng_score = np.random.default_rng(_seed_u32(rng_seed_base, variant_name, seq_name, "tid", int(tid), "score"))
-
-        frames_i = frames.astype(np.int32)
-        gt_i = gt_boxes.astype(np.float32)
-
-        # Primary detection path: instability (hypothesis switching)
-        primary_boxes = _apply_instability_hypothesis_switching(frames_i, gt_i, cfg, rng)
-
-        # Dropout / FN bursts applied to primary detections
-        keep = np.ones((len(frames_i),), dtype=bool)
-        if cfg.dropout_enable:
-            keep = _make_dropout_keep_mask(
-                frames=frames_i,
-                fps=float(cfg.fps),
-                p_start=float(cfg.dropout_p_start),
-                min_s=float(cfg.dropout_min_s),
-                max_s=float(cfg.dropout_max_s),
-                rng=rng,
+    for raw_key, objects in frame_dict.items():
+        frame_key = _parse_frame_key(raw_key)
+        frame = int(frame_key.split(".")[0])
+        canonical_keys.append(f"{frame:06d}.pcd")
+        for obj in objects:
+            label_id = obj.get("label_id")
+            if label_id is None:
+                continue
+            object_class, track_id = _parse_label_id_strict(label_id)
+            if object_class.lower() != class_name.lower():
+                continue
+            by_track_rows.setdefault(int(track_id), []).append(
+                (frame, _box7_from_label_obj(obj))
             )
 
-        # Confuser FP tracklets
-        conf_by_frame_int = _emit_confuser_tracklets_for_track(
-            frames=frames_i,
-            gt_boxes=gt_i,
-            primary_keep=keep,
-            cfg=cfg,
-            rng=rng,
-        )
+    by_track: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+    for track_id, rows in by_track_rows.items():
+        rows.sort(key=lambda item: item[0])
+        frames = np.asarray([item[0] for item in rows], dtype=np.int32)
+        boxes = np.stack([item[1] for item in rows]).astype(np.float32)
+        by_track[track_id] = (frames, boxes)
 
-        # Emit primary detections (TP score distribution)
-        for fr, box, ok in zip(frames_i.tolist(), primary_boxes, keep.tolist()):
-            if not ok:
-                continue
-            frame_key = f"{int(fr):06d}.pcd"
-            s = _sample_primary_score(cfg, score_sampler, rng_score)
-            out_by_frame.setdefault(frame_key, []).append(_DetRow(box7=box.astype(np.float32), score=float(s)))
-
-        # Emit confusers (FP score distribution)
-        for fr_int, boxes_list in conf_by_frame_int.items():
-            frame_key = f"{int(fr_int):06d}.pcd"
-            for b in boxes_list:
-                s = _sample_confuser_score(cfg, score_sampler, rng_score)
-                out_by_frame.setdefault(frame_key, []).append(_DetRow(box7=b.astype(np.float32), score=float(s)))
-
-    return out_by_frame
-
-
-# ============================================================
-# Spec parsing / variant expansion
-# ============================================================
-
-def _variant_cfg_from_dict(name: str, base: Dict[str, Any], override: Dict[str, Any]) -> VariantCfg:
-    merged = dict(base)
-    merged.update(override)
-
-    cfg = VariantCfg(
-        name=name,
-        fps=float(merged.get("fps", 15.0)),
-        class_name=str(merged.get("class_name", "pedestrian")),
-        severity=float(merged.get("severity", 1.0)),
-
-        dropout_enable=bool(merged.get("dropout_enable", False)),
-        dropout_p_start=float(merged.get("dropout_p_start", 0.0)),
-        dropout_min_s=float(merged.get("dropout_min_s", 0.0)),
-        dropout_max_s=float(merged.get("dropout_max_s", 0.0)),
-
-        instability_enable=bool(merged.get("instability_enable", False)),
-        instability_k_modes=int(merged.get("instability_k_modes", 3)),
-        instability_p_switch=float(merged.get("instability_p_switch", 0.0)),
-        instability_mode_xy_sigma_m=float(merged.get("instability_mode_xy_sigma_m", 0.0)),
-        instability_mode_yaw_sigma_rad=float(merged.get("instability_mode_yaw_sigma_rad", 0.0)),
-        instability_mode_lwh_sigma_rel=float(merged.get("instability_mode_lwh_sigma_rel", 0.0)),
-        instability_jitter_xy_sigma_m=float(merged.get("instability_jitter_xy_sigma_m", 0.0)),
-        instability_jitter_yaw_sigma_rad=float(merged.get("instability_jitter_yaw_sigma_rad", 0.0)),
-        instability_jitter_lwh_sigma_rel=float(merged.get("instability_jitter_lwh_sigma_rel", 0.0)),
-        instability_p_yaw_random=float(merged.get("instability_p_yaw_random", 0.0)),
-
-        confuser_enable=bool(merged.get("confuser_enable", False)),
-        confuser_p_start=float(merged.get("confuser_p_start", 0.0)),
-        confuser_min_s=float(merged.get("confuser_min_s", 0.0)),
-        confuser_max_s=float(merged.get("confuser_max_s", 0.0)),
-        confuser_max_active=int(merged.get("confuser_max_active", 1)),
-        confuser_p_static=float(merged.get("confuser_p_static", 0.0)),
-
-        confuser_offset_xy_mu_m=float(merged.get("confuser_offset_xy_mu_m", 0.0)),
-        confuser_offset_xy_sigma_m=float(merged.get("confuser_offset_xy_sigma_m", 0.0)),
-        confuser_yaw_sigma_rad=float(merged.get("confuser_yaw_sigma_rad", 0.0)),
-        confuser_lwh_sigma_rel=float(merged.get("confuser_lwh_sigma_rel", 0.0)),
-
-        confuser_jitter_xy_sigma_m=float(merged.get("confuser_jitter_xy_sigma_m", 0.0)),
-        confuser_jitter_yaw_sigma_rad=float(merged.get("confuser_jitter_yaw_sigma_rad", 0.0)),
-        confuser_jitter_lwh_sigma_rel=float(merged.get("confuser_jitter_lwh_sigma_rel", 0.0)),
-        confuser_p_yaw_random=float(merged.get("confuser_p_yaw_random", 0.0)),
-
-        confuser_static_offset_xy_mu_m=float(merged.get("confuser_static_offset_xy_mu_m", 0.0)),
-        confuser_static_offset_xy_sigma_m=float(merged.get("confuser_static_offset_xy_sigma_m", 0.0)),
-        confuser_static_yaw_sigma_rad=float(merged.get("confuser_static_yaw_sigma_rad", 0.0)),
-        confuser_static_lwh_sigma_rel=float(merged.get("confuser_static_lwh_sigma_rel", 0.0)),
-        confuser_static_jitter_xy_sigma_m=float(merged.get("confuser_static_jitter_xy_sigma_m", 0.0)),
-        confuser_static_jitter_yaw_sigma_rad=float(merged.get("confuser_static_jitter_yaw_sigma_rad", 0.0)),
-        confuser_static_jitter_lwh_sigma_rel=float(merged.get("confuser_static_jitter_lwh_sigma_rel", 0.0)),
-        confuser_static_p_yaw_random=float(merged.get("confuser_static_p_yaw_random", 0.0)),
-
-        confuser_only_when_primary_present=bool(merged.get("confuser_only_when_primary_present", True)),
-
-        # scores
-        score_value=float(merged.get("score_value", 1.0)),
-        score_mode=str(merged.get("score_mode", "constant")),
-        score_dists=str(merged.get("score_dists", "")),
+    return SequenceData(
+        name=path.stem,
+        frame_keys=tuple(sorted(set(canonical_keys))),
+        by_track=by_track,
     )
 
-    # clip probabilities
-    cfg.dropout_p_start = _clip01(cfg.dropout_p_start)
-    cfg.instability_p_switch = _clip01(cfg.instability_p_switch)
-    cfg.instability_p_yaw_random = _clip01(cfg.instability_p_yaw_random)
 
-    cfg.confuser_p_start = _clip01(cfg.confuser_p_start)
-    cfg.confuser_p_yaw_random = _clip01(cfg.confuser_p_yaw_random)
-    cfg.confuser_p_static = _clip01(cfg.confuser_p_static)
-    cfg.confuser_static_p_yaw_random = _clip01(cfg.confuser_static_p_yaw_random)
-
-    cfg.instability_k_modes = max(1, int(cfg.instability_k_modes))
-    cfg.confuser_max_active = max(0, int(cfg.confuser_max_active))
-
-    cfg.score_mode = str(cfg.score_mode).strip().lower() or "constant"
-    return cfg
+def _sample_score(
+    cfg: VariantCfg,
+    sampler: Optional[ScoreSampler],
+    rng: np.random.Generator,
+) -> float:
+    if cfg.score_mode == "sample" and sampler is not None:
+        return sampler.sample(rng)
+    return float(cfg.score_value)
 
 
-def _expand_variants_from_spec(spec: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Tuple[str, Dict[str, Any]]]]:
-    base = dict(spec.get("base", {}))
-    sweeps = dict(spec.get("single_mode_sweeps", {}))
-    combos = list(spec.get("combos", []))
+def _generate_sequence(
+    sequence: SequenceData,
+    cfg: VariantCfg,
+    seed: int,
+    score_sampler: Optional[ScoreSampler],
+) -> Dict[str, List[DetectionRow]]:
+    output: Dict[str, List[DetectionRow]] = {}
+    for track_id, (frames, gt_boxes) in sequence.by_track.items():
+        if cfg.instability_enable:
+            instability_rng = np.random.default_rng(
+                _seed_u32(
+                    seed,
+                    sequence.name,
+                    "tid",
+                    int(track_id),
+                    "instability",
+                    cfg.instability_level,
+                )
+            )
+            boxes = _apply_instability_hypothesis_switching(
+                frames,
+                gt_boxes,
+                cfg,
+                instability_rng,
+            )
+        else:
+            boxes = gt_boxes.copy()
 
-    lookup: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    sweep_variants: List[Tuple[str, Dict[str, Any]]] = []
+        keep = np.ones(len(frames), dtype=bool)
+        if cfg.dropout_enable:
+            dropout_rng = np.random.default_rng(
+                _seed_u32(
+                    seed,
+                    sequence.name,
+                    "tid",
+                    int(track_id),
+                    "dropout",
+                    cfg.dropout_level,
+                )
+            )
+            keep = _make_dropout_keep_mask(
+                frames,
+                cfg.fps,
+                cfg.dropout_p_start,
+                cfg.dropout_min_s,
+                cfg.dropout_max_s,
+                dropout_rng,
+            )
 
-    for mode, levels in sweeps.items():
-        if not isinstance(levels, list):
-            raise ValueError(f"single_mode_sweeps.{mode} must be a list")
-        lookup.setdefault(str(mode), {})
-        for lev in levels:
-            if not isinstance(lev, dict):
+        # Sampling precedes dropout so surviving frames share exactly the same
+        # confidence realization in every retained variant.
+        score_rng = np.random.default_rng(
+            _seed_u32(
+                seed,
+                sequence.name,
+                "tid",
+                int(track_id),
+                "primary-score",
+            )
+        )
+        scores = [
+            _sample_score(cfg, score_sampler, score_rng)
+            for _ in frames
+        ]
+
+        for frame, box, is_kept, score in zip(
+            frames.tolist(), boxes, keep.tolist(), scores
+        ):
+            if not is_kept:
                 continue
-            lev_name = str(lev.get("name", "")).strip()
-            if not lev_name:
-                raise ValueError(f"Missing 'name' in sweep level for mode '{mode}'")
-            lookup[str(mode)][lev_name] = dict(lev)
-            sweep_variants.append((f"{mode}_{lev_name}", dict(lev)))
+            key = f"{int(frame):06d}.pcd"
+            output.setdefault(key, []).append(
+                DetectionRow(box7=box.astype(np.float32), score=float(score))
+            )
+    return output
 
-    combo_variants: List[Tuple[str, Dict[str, Any]]] = []
-    for c in combos:
-        if not isinstance(c, dict):
-            continue
-        cname = str(c.get("name", "")).strip()
-        use = c.get("use", {})
-        if not cname or not isinstance(use, dict):
-            raise ValueError("Each combo must have 'name' and dict 'use'")
+
+def _write_detections(
+    path: Path,
+    detections: Mapping[str, Sequence[DetectionRow]],
+    frame_keys: Sequence[str],
+    class_name: str,
+) -> None:
+    payload: Dict[str, List[Dict[str, Any]]] = {}
+    for frame_key in frame_keys:
+        rows: List[Dict[str, Any]] = []
+        for detection in detections.get(frame_key, []):
+            cx, cy, cz, length, width, height, yaw = [
+                float(value) for value in detection.box7.tolist()
+            ]
+            rows.append(
+                {
+                    "box": {
+                        "cx": cx,
+                        "cy": cy,
+                        "cz": cz,
+                        "h": height,
+                        "l": length,
+                        "rot_z": yaw,
+                        "w": width,
+                    },
+                    "label_id": f"{class_name}:-1",
+                    "file_id": frame_key,
+                    "score": float(detection.score),
+                }
+            )
+        payload[frame_key] = rows
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        json.dump({"detections": payload}, stream)
+
+
+# ---------------------------------------------------------------------------
+# Specification and manifest
+# ---------------------------------------------------------------------------
+
+
+def _variant_name(mode: str, level_name: str) -> str:
+    if mode == "clean":
+        return "clean"
+    return (
+        level_name
+        if level_name.startswith(mode + "_")
+        else f"{mode}_{level_name}"
+    )
+
+
+def _expand_variants(
+    spec: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], List[Tuple[str, str, Dict[str, Any]]]]:
+    base = dict(spec.get("base", {}))
+    sweeps = spec.get("single_mode_sweeps", {})
+    if not isinstance(sweeps, dict):
+        raise ValueError("single_mode_sweeps must be a mapping")
+    unknown_modes = set(map(str, sweeps)) - ALLOWED_MODES
+    if unknown_modes:
+        raise ValueError(
+            "The protocol accepts only clean, dropout, and instability; found "
+            f"{sorted(unknown_modes)}"
+        )
+    variants: List[Tuple[str, str, Dict[str, Any]]] = []
+    lookup: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for raw_mode, entries in sweeps.items():
+        mode = str(raw_mode)
+        if not isinstance(entries, list):
+            raise ValueError(f"single_mode_sweeps.{mode} must be a list")
+        for entry in entries:
+            if not isinstance(entry, dict) or "name" not in entry:
+                raise ValueError(f"Invalid entry in single_mode_sweeps.{mode}")
+            level_name = str(entry["name"]).strip()
+            if not level_name:
+                raise ValueError(f"Empty level name in {mode}")
+            override = dict(entry)
+            if mode == "dropout":
+                override["dropout_level"] = level_name
+            elif mode == "instability":
+                override["instability_level"] = level_name
+            lookup.setdefault(mode, {})[level_name] = dict(override)
+            variants.append(
+                (_variant_name(mode, level_name), mode, override)
+            )
+
+    combos = spec.get("combos", [])
+    if not isinstance(combos, list):
+        raise ValueError("combos must be a list")
+    for entry in combos:
+        if not isinstance(entry, dict) or "name" not in entry:
+            raise ValueError("Each combined entry must contain a name")
+        name = str(entry["name"]).strip()
+        use = entry.get("use")
+        if not isinstance(use, dict) or set(map(str, use)) != {
+            "dropout",
+            "instability",
+        }:
+            raise ValueError(
+                f"{name}: Combined must reference exactly dropout and instability"
+            )
         merged: Dict[str, Any] = {}
-        for mode, lev_name in use.items():
-            mode_s = str(mode)
-            lev_s = str(lev_name)
-            if mode_s not in lookup or lev_s not in lookup[mode_s]:
-                raise ValueError(f"Combo '{cname}' references missing {mode_s}:{lev_s}")
-            merged.update(dict(lookup[mode_s][lev_s]))
-        if "overrides" in c and isinstance(c["overrides"], dict):
-            merged.update(dict(c["overrides"]))
-        combo_variants.append((cname, merged))
+        for mode in ("instability", "dropout"):
+            level_name = str(use[mode]).strip()
+            try:
+                component = lookup[mode][level_name]
+            except KeyError as error:
+                raise ValueError(
+                    f"{name}: missing {mode} level {level_name!r}"
+                ) from error
+            merged.update(component)
+        if isinstance(entry.get("overrides"), dict):
+            merged.update(dict(entry["overrides"]))
+        variants.append((name, "combined", merged))
 
-    # clean baseline
-    clean = ("clean", {
-        "dropout_enable": False,
-        "dropout_p_start": 0.0,
-        "dropout_min_s": 0.0,
-        "dropout_max_s": 0.0,
-
-        "instability_enable": False,
-        "instability_k_modes": 3,
-        "instability_p_switch": 0.0,
-        "instability_mode_xy_sigma_m": 0.0,
-        "instability_mode_yaw_sigma_rad": 0.0,
-        "instability_mode_lwh_sigma_rel": 0.0,
-        "instability_jitter_xy_sigma_m": 0.0,
-        "instability_jitter_yaw_sigma_rad": 0.0,
-        "instability_jitter_lwh_sigma_rel": 0.0,
-        "instability_p_yaw_random": 0.0,
-
-        "confuser_enable": False,
-        "confuser_p_start": 0.0,
-        "confuser_min_s": 0.0,
-        "confuser_max_s": 0.0,
-        "confuser_max_active": 0,
-        "confuser_p_static": 0.0,
-
-        "confuser_offset_xy_mu_m": 0.0,
-        "confuser_offset_xy_sigma_m": 0.0,
-        "confuser_yaw_sigma_rad": 0.0,
-        "confuser_lwh_sigma_rel": 0.0,
-        "confuser_jitter_xy_sigma_m": 0.0,
-        "confuser_jitter_yaw_sigma_rad": 0.0,
-        "confuser_jitter_lwh_sigma_rel": 0.0,
-        "confuser_p_yaw_random": 0.0,
-
-        "confuser_static_offset_xy_mu_m": 0.0,
-        "confuser_static_offset_xy_sigma_m": 0.0,
-        "confuser_static_yaw_sigma_rad": 0.0,
-        "confuser_static_lwh_sigma_rel": 0.0,
-        "confuser_static_jitter_xy_sigma_m": 0.0,
-        "confuser_static_jitter_yaw_sigma_rad": 0.0,
-        "confuser_static_jitter_lwh_sigma_rel": 0.0,
-        "confuser_static_p_yaw_random": 0.0,
-
-        "confuser_only_when_primary_present": True,
-    })
-
-    variants = [clean] + sweep_variants + combo_variants
+    names = {name for name, _mode, _override in variants}
+    if names != EXPECTED_VARIANTS:
+        raise ValueError(
+            "The spec must expand to the ten agreed variants. "
+            f"Missing={sorted(EXPECTED_VARIANTS - names)}, "
+            f"extra={sorted(names - EXPECTED_VARIANTS)}"
+        )
     return base, variants
 
 
-# ============================================================
-# Load GT-by-track from JSON
-# ============================================================
-
-def _load_gt_internal_by_tid_from_json(gt_json: Path, class_name: str) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
-    frame_dict = _load_labels_3d_json(gt_json)
-
-    by_tid: Dict[int, List[Tuple[int, np.ndarray]]] = {}
-    for frame_key_raw, objs in frame_dict.items():
-        frame_key = _parse_frame_key(frame_key_raw)
-        fr_str = frame_key.split(".")[0]
-        fr = int(fr_str)
-
-        for obj in objs:
-            label_id = obj.get("label_id", None)
-            if label_id is None:
-                continue
-            cls, tid = _parse_label_id_strict(label_id)
-            if cls.lower() != str(class_name).lower():
-                continue
-            box7 = _box7_from_label_obj(obj)
-            by_tid.setdefault(int(tid), []).append((fr, box7))
-
-    out: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-    for tid, items in by_tid.items():
-        items.sort(key=lambda x: x[0])
-        frames = np.array([fr for fr, _ in items], dtype=np.int32)
-        boxes = np.stack([b for _, b in items], axis=0).astype(np.float32)
-        out[int(tid)] = (frames, boxes)
-    return out
+_GENERATION_CFG_FIELDS = (
+    "fps",
+    "class_name",
+    "severity",
+    "dropout_enable",
+    "dropout_p_start",
+    "dropout_min_s",
+    "dropout_max_s",
+    "instability_enable",
+    "instability_k_modes",
+    "instability_p_switch",
+    "instability_mode_xy_sigma_m",
+    "instability_mode_yaw_sigma_rad",
+    "instability_mode_lwh_sigma_rel",
+    "instability_jitter_xy_sigma_m",
+    "instability_jitter_yaw_sigma_rad",
+    "instability_jitter_lwh_sigma_rel",
+    "instability_p_yaw_random",
+    "score_value",
+    "score_mode",
+    "score_dists",
+    "dropout_level",
+    "instability_level",
+)
 
 
-# ============================================================
-# Write detections JSON in detector schema
-# ============================================================
-
-def _write_detections_json(
-    out_json: Path,
-    dets_by_frame: Dict[str, List[_DetRow]],
-    class_name: str,
-    all_frame_keys: Optional[List[str]] = None,
-) -> None:
-    dets: Dict[str, List[Dict[str, Any]]] = {}
-
-    frame_keys = sorted(dets_by_frame.keys()) if all_frame_keys is None else list(all_frame_keys)
-
-    for frame_key in frame_keys:
-        rows: List[Dict[str, Any]] = []
-        for d in dets_by_frame.get(frame_key, []):
-            box7 = d.box7
-            cx, cy, cz, l, w, h, rot_z = [float(v) for v in box7.tolist()]
-            rows.append({
-                "box": {"cx": cx, "cy": cy, "cz": cz, "h": h, "l": l, "rot_z": rot_z, "w": w},
-                "label_id": f"{class_name}:-1",
-                "file_id": str(frame_key),
-                "score": float(d.score),
-            })
-        dets[str(frame_key)] = rows
-
-    payload = {"detections": dets}
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-    with out_json.open("w", encoding="utf-8") as f:
-        json.dump(payload, f)
+def _previous_variant_is_compatible(
+    previous_entry: Optional[Mapping[str, Any]],
+    cfg: VariantCfg,
+    *,
+    previous_seed_matches: bool,
+) -> bool:
+    if previous_entry is None or not previous_seed_matches:
+        return False
+    if str(previous_entry.get("gt_key", "original")) != "original":
+        return False
+    previous_cfg = previous_entry.get("resolved_cfg")
+    if not isinstance(previous_cfg, dict):
+        return False
+    if bool(previous_cfg.get("confuser_enable", False)):
+        return False
+    current = asdict(cfg)
+    return all(
+        previous_cfg.get(field) == current.get(field)
+        for field in _GENERATION_CFG_FIELDS
+    )
 
 
-# ============================================================
-# CLI
-# ============================================================
+def _severity_metadata(name: str, mode: str) -> Tuple[str, int]:
+    if mode == "clean":
+        return "Clean", -1
+    for index, label in enumerate(("L1", "L2", "L3")):
+        if name.endswith(f"_{label}"):
+            return ("Mild", "Moderate", "Severe")[index], index
+    return "", -1
+
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="tracker_eval.generate_pseudo_detections_from_gt",
-        description="Generate pseudo-detections (JSON) from GT (labels_3d JSON) with controlled failure modes.",
+    parser = argparse.ArgumentParser(
+        prog="tracker-eval-generate-pseudo",
+        description=(
+            "Incrementally generate Clean, Dropout L1-L3, Instability L1-L3, "
+            "and symmetric Combined L1-L3 pseudo detections against unchanged "
+            "JRDB GT."
+        ),
     )
-    p.add_argument("--split_root", type=str, required=True)
-    p.add_argument("--labels_subdir", type=str, default="labels_3d")
-    p.add_argument("--spec", type=str, required=True)
-    p.add_argument("--out_detections_subdir", type=str, default="detections_3D_pseudo")
-    p.add_argument("--seed", type=int, default=0)
-
-    # New: score distribution file (overrides YAML score_dists)
-    p.add_argument("--score_dists", type=str, default=None,
-                   help="Path to JSON containing TP/FP score arrays; enables score_mode=sample if provided.")
-
-    p.add_argument("--include_variants", type=str, nargs="*", default=None)
-    p.add_argument("--exclude_variants", type=str, nargs="*", default=None)
-    p.add_argument("--quiet", action="store_true")
-    return p
+    parser.add_argument("--split_root", required=True)
+    parser.add_argument("--split_name", default=None)
+    parser.add_argument("--labels_subdir", default="labels_3d")
+    parser.add_argument(
+        "--odometry_root",
+        required=True,
+        help=(
+            "Stored in manifest.json for later --global_coords tracker runs; "
+            "Generation itself stays in the original local coordinates."
+        ),
+    )
+    parser.add_argument("--spec", required=True)
+    parser.add_argument(
+        "--out_detections_subdir",
+        default="detections_3D_pseudo",
+        help="Output directory name under the split root.",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--score_dists",
+        default=None,
+        help="Optional JSON/NPZ TP score distribution overriding the YAML path.",
+    )
+    parser.add_argument("--include_variants", nargs="*", default=None)
+    parser.add_argument("--exclude_variants", nargs="*", default=None)
+    parser.add_argument(
+        "--overwrite_variants",
+        nargs="*",
+        default=None,
+        help="Comma/space-separated variant names whose existing JSONs are replaced.",
+    )
+    parser.add_argument("--quiet", action="store_true")
+    return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_argparser().parse_args(argv)
     split_root = Path(args.split_root)
-    labels_dir = split_root / str(args.labels_subdir)
-
-    if not labels_dir.exists():
-        raise FileNotFoundError(f"labels_subdir not found: {labels_dir}")
-
+    split_name = str(args.split_name or split_root.name)
+    labels_dir = split_root / args.labels_subdir
     spec_path = Path(args.spec)
-    if not spec_path.exists():
-        raise FileNotFoundError(f"spec not found: {spec_path}")
+    if not labels_dir.is_dir():
+        raise FileNotFoundError(f"GT labels directory not found: {labels_dir}")
+    if not spec_path.is_file():
+        raise FileNotFoundError(f"Specification not found: {spec_path}")
 
-    with spec_path.open("r", encoding="utf-8") as f:
-        spec = yaml.safe_load(f)
+    with spec_path.open("r", encoding="utf-8") as stream:
+        spec = yaml.safe_load(stream)
+    if not isinstance(spec, dict):
+        raise ValueError(f"Expected a YAML mapping in {spec_path}")
+    base, all_variants = _expand_variants(spec)
 
-    base, variant_defs = _expand_variants_from_spec(spec)
+    include = set(_split_values(args.include_variants)) or None
+    exclude = set(_split_values(args.exclude_variants))
+    variants = [
+        item
+        for item in all_variants
+        if (include is None or item[0] in include) and item[0] not in exclude
+    ]
+    if not variants:
+        raise ValueError("No variants remain selected")
 
-    include = set(args.include_variants) if args.include_variants else None
-    exclude = set(args.exclude_variants) if args.exclude_variants else set()
-    variant_defs = [(n, o) for (n, o) in variant_defs if (include is None or n in include) and (n not in exclude)]
-    if not variant_defs:
-        raise ValueError("No variants selected after include/exclude filtering.")
+    selected_names = {name for name, _mode, _override in variants}
+    overwrite = set(_split_values(args.overwrite_variants))
+    unknown_overwrite = overwrite - selected_names
+    if unknown_overwrite:
+        raise ValueError(
+            f"--overwrite_variants contains unselected names: {sorted(unknown_overwrite)}"
+        )
 
-    gt_seq_paths = sorted(labels_dir.glob("*.json"))
-    if not gt_seq_paths:
-        raise FileNotFoundError(f"No GT .json files found in {labels_dir}")
+    gt_paths = sorted(labels_dir.glob("*.json"))
+    if not gt_paths:
+        raise FileNotFoundError(f"No GT JSON files found in {labels_dir}")
+    class_name = str(base.get("class_name", "pedestrian"))
+    sequences = [_load_sequence(path, class_name) for path in gt_paths]
 
-    out_root = split_root / str(args.out_detections_subdir)
-    out_root.mkdir(parents=True, exist_ok=True)
-
-    # Load global score sampler once (if provided)
+    score_mode = str(base.get("score_mode", "constant")).strip().lower()
+    score_path_value = args.score_dists or base.get("score_dists")
     score_sampler: Optional[ScoreSampler] = None
-    score_dists_path_cli = Path(args.score_dists) if args.score_dists else None
-    if score_dists_path_cli is not None:
-        if not score_dists_path_cli.exists():
-            raise FileNotFoundError(f"--score_dists not found: {score_dists_path_cli}")
-        score_sampler = ScoreSampler(_load_score_distributions(score_dists_path_cli))
+    score_path: Optional[Path] = None
+    if score_mode == "sample":
+        if not score_path_value:
+            raise ValueError("score_mode=sample requires score_dists")
+        score_path = Path(str(score_path_value))
+        if not score_path.is_file():
+            raise FileNotFoundError(f"Score distribution not found: {score_path}")
+        score_sampler = ScoreSampler(_load_score_distribution(score_path))
 
-    manifest: Dict[str, Any] = {
+    out_root = split_root / args.out_detections_subdir
+    out_root.mkdir(parents=True, exist_ok=True)
+    previous_manifest_path = out_root / "manifest.json"
+    previous_manifest: Dict[str, Any] = {}
+    if previous_manifest_path.is_file():
+        try:
+            with previous_manifest_path.open("r", encoding="utf-8") as stream:
+                loaded = json.load(stream)
+            if isinstance(loaded, dict):
+                previous_manifest = loaded
+        except (OSError, json.JSONDecodeError):
+            previous_manifest = {}
+    previous_by_name = {
+        str(entry.get("name")): entry
+        for entry in previous_manifest.get("variants", [])
+        if isinstance(entry, dict) and entry.get("name")
+    }
+    previous_seed_matches = previous_manifest.get("seed") == int(args.seed)
+    manifest_variants: List[Dict[str, Any]] = []
+    status_rows: List[Dict[str, Any]] = []
+
+    if not args.quiet:
+        print(f"[tracker_eval] GT:       {labels_dir}")
+        print(f"[tracker_eval] Output:   {out_root}")
+        print(f"[tracker_eval] Variants: {len(variants)}")
+        print(
+            "[tracker_eval] Existing sequence JSONs are reused only when the "
+            "previous manifest confirms an identical standard-GT generation "
+            "configuration and the variant is not explicitly overwritten."
+        )
+
+    for variant_index, (name, mode, override) in enumerate(variants, start=1):
+        cfg = _apply_severity_once(
+            _variant_cfg_from_dict(name, base, override)
+        )
+        if mode == "clean" and (cfg.dropout_enable or cfg.instability_enable):
+            raise ValueError(f"{name}: Clean must not enable a corruption")
+        if mode == "combined" and not (
+            cfg.dropout_enable and cfg.instability_enable
+        ):
+            raise ValueError(
+                f"{name}: Combined must enable both dropout and instability"
+            )
+        variant_dir = out_root / name
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        generated = 0
+        reused = 0
+        previous_compatible = _previous_variant_is_compatible(
+            previous_by_name.get(name),
+            cfg,
+            previous_seed_matches=previous_seed_matches,
+        )
+
+        for sequence in sequences:
+            output_path = variant_dir / f"{sequence.name}.json"
+            if (
+                name not in overwrite
+                and previous_compatible
+                and output_path.is_file()
+                and output_path.stat().st_size > 0
+            ):
+                reused += 1
+                continue
+            detections = _generate_sequence(
+                sequence,
+                cfg,
+                int(args.seed),
+                score_sampler,
+            )
+            _write_detections(
+                output_path,
+                detections,
+                sequence.frame_keys,
+                cfg.class_name,
+            )
+            generated += 1
+
+        severity, severity_index = _severity_metadata(name, mode)
+        manifest_variants.append(
+            {
+                "name": name,
+                "failure_mode": mode,
+                "severity": severity,
+                "severity_index": severity_index,
+                "override": override,
+                "resolved_cfg": asdict(cfg),
+                "detections_subdir": str(
+                    Path(args.out_detections_subdir) / name
+                ),
+                "gt_key": "original",
+                "labels_subdir": str(args.labels_subdir),
+                "gt_tracker_name": "GT",
+                "gt_tracker_name_global": "GT__global",
+            }
+        )
+        status_rows.append(
+            {
+                "variant": name,
+                "n_sequences": len(sequences),
+                "n_generated": generated,
+                "n_reused": reused,
+                "overwrite_requested": name in overwrite,
+                "previous_manifest_compatible": previous_compatible,
+            }
+        )
+        if not args.quiet:
+            print(
+                f"[tracker_eval] ({variant_index}/{len(variants)}) {name}: "
+                f"generated={generated}, reused={reused}"
+            )
+
+    manifest = {
+        "manifest_format": "pseudo_detection_protocol",
+        "protocol": "clean_dropout_instability_combined_standard_gt",
         "split_root": str(split_root),
+        "split_name": split_name,
         "labels_subdir": str(args.labels_subdir),
         "out_detections_subdir": str(args.out_detections_subdir),
+        "odometry_root": str(args.odometry_root),
         "seed": int(args.seed),
         "spec_path": str(spec_path),
+        "spec_sha256": _sha256(spec_path),
         "base": base,
-        "score_dists": str(score_dists_path_cli) if score_dists_path_cli is not None else None,
-        "variants": [],
+        "score_dists": str(score_path) if score_path is not None else None,
+        "standard_gt_only": True,
+        "gt_definitions": {
+            "original": {
+                "labels_subdir": str(args.labels_subdir),
+                "gt_tracker_name": "GT",
+                "gt_tracker_name_global": "GT__global",
+            }
+        },
+        "variants": manifest_variants,
+        "trackeval_groups": {
+            "GT__global": [entry["name"] for entry in manifest_variants]
+        },
     }
-
-    if not args.quiet:
-        print(f"[tracker_eval] GT input: {labels_dir} ({len(gt_seq_paths)} sequences)")
-        print(f"[tracker_eval] Output:   {out_root}")
-        print(f"[tracker_eval] Variants: {len(variant_defs)}")
-        if score_sampler is not None:
-            print(f"[tracker_eval] Scores:   sampling enabled (TP/FP distributions loaded)")
-        else:
-            print(f"[tracker_eval] Scores:   constant (cfg.score_value) unless YAML enables sampling")
-
-    for vi, (vname, voverride) in enumerate(variant_defs):
-        cfg_raw = _variant_cfg_from_dict(vname, base, voverride)
-        cfg = _apply_severity_once(cfg_raw)
-
-        # Determine per-variant score sampler + mode:
-        #  - CLI score_dists overrides everything.
-        #  - Otherwise, if YAML sets score_mode=sample and score_dists, load it.
-        v_score_sampler = score_sampler
-        if v_score_sampler is None:
-            # Try YAML-provided path
-            if cfg.score_mode == "sample":
-                if not cfg.score_dists:
-                    raise ValueError(
-                        f"Variant '{vname}' has score_mode=sample but no score_dists set (and no --score_dists)."
-                    )
-                p = Path(cfg.score_dists)
-                if not p.exists():
-                    raise FileNotFoundError(f"Variant '{vname}' score_dists not found: {p}")
-                v_score_sampler = ScoreSampler(_load_score_distributions(p))
-
-        # If sampler exists, force score_mode to sample (so YAML doesn't accidentally keep constant)
-        if v_score_sampler is not None:
-            cfg.score_mode = "sample"
-
-        vdir = out_root / vname
-        vdir.mkdir(parents=True, exist_ok=True)
-
-        manifest["variants"].append({
-            "name": vname,
-            "override": voverride,
-            "resolved_cfg": cfg.__dict__,
-        })
-
-        if not args.quiet:
-            print(f"[tracker_eval] ({vi+1}/{len(variant_defs)}) variant='{vname}'")
-
-        for si, gt_json in enumerate(gt_seq_paths):
-            seq = gt_json.stem
-            all_frame_keys = _all_frame_keys_from_gt_json(gt_json)
-            gt_by_tid = _load_gt_internal_by_tid_from_json(gt_json, class_name=cfg.class_name)
-
-            dets_by_frame = _generate_pseudo_boxes_by_frame(
-                gt_by_tid=gt_by_tid,
-                cfg=cfg,
-                rng_seed_base=int(args.seed),
-                variant_name=vname,
-                seq_name=seq,
-                score_sampler=v_score_sampler,
-            )
-
-            out_json = vdir / f"{seq}.json"
-            _write_detections_json(
-                out_json=out_json,
-                dets_by_frame=dets_by_frame,
-                class_name=cfg.class_name,
-                all_frame_keys=all_frame_keys,
-            )
-
-            if not args.quiet and (si + 1) % 10 == 0:
-                print(f"  ... {si+1}/{len(gt_seq_paths)} sequences")
-
     manifest_path = out_root / "manifest.json"
-    with manifest_path.open("w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
+    with manifest_path.open("w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, indent=2)
+
+    variant_map_path = out_root / "variant_gt_map.csv"
+    with variant_map_path.open("w", encoding="utf-8", newline="") as stream:
+        fieldnames = [
+            "variant",
+            "failure_mode",
+            "severity",
+            "detections_subdir",
+            "labels_subdir",
+            "gt_key",
+            "gt_tracker_name",
+            "gt_tracker_name_global",
+        ]
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        for entry in manifest_variants:
+            writer.writerow(
+                {
+                    "variant": entry["name"],
+                    "failure_mode": entry["failure_mode"],
+                    "severity": entry["severity"],
+                    "detections_subdir": entry["detections_subdir"],
+                    "labels_subdir": entry["labels_subdir"],
+                    "gt_key": entry["gt_key"],
+                    "gt_tracker_name": entry["gt_tracker_name"],
+                    "gt_tracker_name_global": entry[
+                        "gt_tracker_name_global"
+                    ],
+                }
+            )
+
+    status_path = out_root / "generation_status.csv"
+    with status_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=[
+                "variant",
+                "n_sequences",
+                "n_generated",
+                "n_reused",
+                "overwrite_requested",
+                "previous_manifest_compatible",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(status_rows)
 
     if not args.quiet:
-        print(f"[tracker_eval] Done. Manifest: {manifest_path}")
+        print(f"[tracker_eval] Manifest: {manifest_path}")
+        print(f"[tracker_eval] Variant/GT map: {variant_map_path}")
+        print(f"[tracker_eval] Generation status: {status_path}")
     return 0
 
 

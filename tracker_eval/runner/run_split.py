@@ -215,6 +215,13 @@ def _build_tracker_from_spec(spec: Dict[str, Any]) -> Tracker3D:
             detection_th=float(cfg.get("detection_th", 0.5)),
             score_update=cfg.get("score_update", None),
             model_path=cfg.get("model_path", None),
+            motion_model=str(cfg.get("motion_model", "KF")),
+            distance_gate_m=float(cfg.get("distance_gate_m", 0.7)),
+            score_decay_per_s=(
+                None
+                if cfg.get("score_decay_per_s", None) is None
+                else float(cfg["score_decay_per_s"])
+            ),
             fps=float(cfg.get("fps", 15.0)),
             track_class=cfg.get("track_class", "pedestrian"),
             export_score=bool(cfg.get("export_score", False)),
@@ -229,45 +236,22 @@ def _build_tracker_from_spec(spec: Dict[str, Any]) -> Tracker3D:
             track_class=str(cfg.get("track_class", "pedestrian")),
             input_score=float(cfg.get("input_score", 0.5)),
             export_score=bool(cfg.get("export_score", False)),
-            timestamp_mode=str(cfg.get("timestamp_mode", "frame_index")),
+            output_coast_s=float(cfg.get("output_coast_s", 0.5)),
+            association_gate_m=float(cfg.get("association_gate_m", 2.0)),
         )
         return ELPTnetAdapter(cfg=tcfg)
 
-    if tracker_key == "headroom":
-        from tracker_eval.trackers.headroom_adapter import HeadroomAdapter, HeadroomConfig
-        from tracker_eval.trackers.headroom_kf_adapter import HeadroomTrackerKF, HeadroomKFConfig
-        tcfg = HeadroomConfig(
-        # tcfg = HeadroomKFConfig(
-            fps=float(cfg.get("fps", 15.0)),
-
-            T_reid_base_s=float(cfg.get("T_reid_base_s", 1.0)),
-            T_reid_static_s=float(cfg.get("T_reid_static_s", 2.0)),
-
-            score_floor=float(cfg.get("score_floor", 0.5)),
-            score_power=float(cfg.get("score_power", 1.5)),
-            tau_hit_s=float(cfg.get("tau_hit_s", 0.10)),
-            tau_miss_s=float(cfg.get("tau_miss_s", 2.0)),
-            theta_on=float(cfg.get("theta_on", 0.50)),
-            min_hits=int(cfg.get("min_hits", 2)),
-
-            T_out_min_s=float(cfg.get("T_out_min_s", 0.30)),
-            T_out_max_s=float(cfg.get("T_out_max_s", 1.0)),
-            T_out_gamma=float(cfg.get("T_out_gamma", 1.0)),
-
-            dist_gate_m=float(cfg.get("dist_gate_m", 0.45)),
-            z_gate_m=float(cfg.get("z_gate_m", 1.0)),
-            assoc_topk=int(cfg.get("assoc_topk", 10)),
-            assoc_iou_weight=float(cfg.get("assoc_iou_weight", 5.0)),
-
-            v_static_thr_mps=float(cfg.get("v_static_thr_mps", 0.20)),
-            jitter_thr_m=float(cfg.get("jitter_thr_m", 0.15)),
-            static_window=int(cfg.get("static_window", 15)),
-
-            gt_stride=int(cfg.get("gt_stride", 100000)),
-            fp_offset=int(cfg.get("fp_offset", 10000000)),
+    if tracker_key == "pedreftrack":
+        from tracker_eval.trackers.pedreftrack_adapter import (
+            PedRefTrackAdapter,
+            PedRefTrackConfig,
+            pedreftrack_local_name,
         )
-        return HeadroomAdapter(cfg=tcfg)
-        # return HeadroomTrackerKF(cfg=tcfg)
+        tcfg = PedRefTrackConfig(**dict(cfg))
+        return PedRefTrackAdapter(
+            cfg=tcfg,
+            name=pedreftrack_local_name(tcfg.mode),
+        )
 
     raise ValueError(f"Unknown tracker in spec: {tracker_key}")
 
@@ -283,7 +267,9 @@ def _run_one_sequence_worker(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     seq_name = str(job["seq_name"])
     det_json_path = str(job["det_json_path"])
-    out_kitti_txt = str(job["out_kitti_txt"]) if job.get("out_kitti_txt") else ""
+    out_kitti_txt = str(job.get("out_kitti_txt", "")).strip()
+    if not out_kitti_txt:
+        raise ValueError("A KITTI output path is required for every sequence job.")
     kitti_use_score = bool(job.get("kitti_use_score", True))
     warmup_steps = int(job.get("warmup_steps", 0))
     tracker_spec = job["tracker_spec"]
@@ -352,7 +338,7 @@ def _run_one_sequence_worker(job: Dict[str, Any]) -> Dict[str, Any]:
         write_sequence_outputs(
             seq_name=seq_name,
             tracks_by_frame=tracks_by_frame,
-            out_kitti_txt=out_kitti_txt if out_kitti_txt else None,
+            out_kitti_txt=out_kitti_txt,
             kitti_use_score=kitti_use_score,
         )
 
@@ -438,16 +424,20 @@ def run_tracker_on_split(
     Parallel mode: sequences processed concurrently (one tracker instance per sequence),
                    timing/per-frame profiling disabled.
     """
+    if not write_kitti_txt:
+        raise ValueError(
+            "KITTI output is required because it is the input to the evaluation pipeline."
+        )
     split_root = Path(split_root)
     det_dir = split_root / detections_subdir
     if not det_dir.exists():
         raise FileNotFoundError(f"Detections directory not found: {det_dir}")
     
     global_coords = bool(global_coords)
-    odometry_root = Path(odometry_root) if str(odometry_root) else Path()
-
-    if global_coords and (not str(odometry_root)):
+    odometry_root_text = str(odometry_root).strip()
+    if global_coords and not odometry_root_text:
         raise ValueError("--global_coords requires --odometry_root to be set.")
+    odometry_root = Path(odometry_root_text) if odometry_root_text else Path()
 
 
     out_root = Path(out_root)
@@ -504,7 +494,7 @@ def run_tracker_on_split(
 
             out_kitti_txt = out_kitti_dir / f"{seq_name}.txt"
 
-            if skip_existing_kitti and write_kitti_txt and out_kitti_txt.exists():
+            if skip_existing_kitti and out_kitti_txt.exists():
                 if verbose:
                     print(f"[tracker_eval] ({idx+1}/{len(seqs)}) {seq_name}: output exists, skipping")
                 per_seq_rows.append(
@@ -572,7 +562,7 @@ def run_tracker_on_split(
             write_sequence_outputs(
                 seq_name=seq_name,
                 tracks_by_frame=tracks_by_frame,
-                out_kitti_txt=str(out_kitti_txt) if write_kitti_txt else None,
+                out_kitti_txt=str(out_kitti_txt),
                 kitti_use_score=kitti_use_score,
             )
 
@@ -592,7 +582,7 @@ def run_tracker_on_split(
                 {
                     "status": "ok",
                     "detections_json": str(det_json_path),
-                    "out_kitti_txt": str(out_kitti_txt) if write_kitti_txt else "",
+                    "out_kitti_txt": str(out_kitti_txt),
                     "frame_stats_csv": str(frame_stats_path),
                 }
             )
@@ -623,7 +613,7 @@ def run_tracker_on_split(
 
             out_kitti_txt = out_kitti_dir / f"{seq_name}.txt"
 
-            if skip_existing_kitti and write_kitti_txt and out_kitti_txt.exists():
+            if skip_existing_kitti and out_kitti_txt.exists():
                 skipped += 1
                 per_seq_rows.append(
                     {
@@ -639,7 +629,7 @@ def run_tracker_on_split(
                 {
                     "seq_name": seq_name,
                     "det_json_path": str(det_json_path),
-                    "out_kitti_txt": str(out_kitti_txt) if write_kitti_txt else "",
+                    "out_kitti_txt": str(out_kitti_txt),
                     "kitti_use_score": bool(kitti_use_score),
                     "warmup_steps": int(warmup_steps),
 

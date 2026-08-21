@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -20,7 +20,7 @@ class FastPolyConfig:
     directly, and we only override the bare minimum fields needed for single-seq usage.
     """
     # The FastPoly YAML config dict (already loaded with yaml.safe_load)
-    config: Dict[str, Any] = "/home/scai/trackers/FastPoly/config/nusc_config.yaml"
+    config: Dict[str, Any] = field(default_factory=dict)
 
     # Sequence id used by FastPoly internal outputs
     # (FastPoly wants data_info['seq_id'] to exist)
@@ -100,8 +100,8 @@ class FastPolyAdapter(TrackerBase):
         Returns:
           Tracker class, arraydet2box function
         """
-        from tracking.nusc_tracker import Tracker  # type: ignore
-        from pre_processing.nusc_data_conversion import arraydet2box  # type: ignore
+        from tracker_eval.trackers.implementations.fastpoly.tracking.nusc_tracker import Tracker
+        from tracker_eval.trackers.implementations.fastpoly.pre_processing.nusc_data_conversion import arraydet2box
         return Tracker, arraydet2box
 
     def _get_ped_label(self) -> int:
@@ -113,7 +113,7 @@ class FastPolyAdapter(TrackerBase):
             return int(self.cfg.force_class_label)
 
         if self._ped_label is None:
-            from data.script.NUSC_CONSTANT import CLASS_SEG_TO_STR_CLASS  # type: ignore
+            from tracker_eval.trackers.implementations.fastpoly.data.script.NUSC_CONSTANT import CLASS_SEG_TO_STR_CLASS
             self._ped_label = int(CLASS_SEG_TO_STR_CLASS["pedestrian"])
         return int(self._ped_label)
 

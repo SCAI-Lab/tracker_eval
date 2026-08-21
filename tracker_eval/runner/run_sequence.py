@@ -110,7 +110,7 @@ def _tracker_step(
         return FrameData(frame_id=frame_id, dets=out)
 
     raise TypeError(
-        "Tracker.step must return FrameData (preferred) or List[Detection] (legacy). "
+        "Tracker.step must return FrameData (preferred) or List[Detection] (compatibility form). "
         f"Got: {type(out)}"
     )
 
@@ -279,10 +279,11 @@ def write_sequence_outputs(
     *,
     seq_name: str,
     tracks_by_frame: Dict[str, FrameData],
-    out_kitti_txt: Optional[str] = None,
+    out_kitti_txt: str,
     kitti_use_score: bool = True,
 ) -> None:
-    
+    if not str(out_kitti_txt).strip():
+        raise ValueError("out_kitti_txt is required by the evaluation pipeline.")
     rows_by_frame = tracks_by_frame_to_kitti_rows(tracks_by_frame)
     write_sequence_kitti_txt(
         out_txt_path=out_kitti_txt,

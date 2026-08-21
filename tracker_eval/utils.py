@@ -158,12 +158,12 @@ def _load_per_frame_dict(
 
 
 def _load_frame_dict_any(path: Path) -> Dict[str, List[Dict[str, Any]]]:
-    # Backwards-compatible alias used by build_score_distributions_from_gt_det.py
+    # Shared loader used by the score-distribution builder.
     return _load_per_frame_dict(path)
 
 
 def _load_labels_3d_json(path: Path) -> Dict[str, List[Dict[str, Any]]]:
-    # Backwards-compatible alias used by convert_gt_to_kitti_3d.py and generate_pseudo_detections_from_gt.py
+    # Shared source-label loader used by pseudo generation and GT preparation.
     return _load_per_frame_dict(path, container_keys=("labels", "annotations", "frames", "data", "detections"))
 
 

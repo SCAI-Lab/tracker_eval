@@ -418,7 +418,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             monotonic=bool(int(args.calib_monotonic)),
             edge_mode=str(args.calib_edge_mode),
         )
-        # Store under stable names for headroom_adapter.py
+        # Store under stable names for pedreftrack_adapter.py
         save_dict.update(
             score_calib_edges=calib["edges"],
             score_calib_prec=calib["prec"],

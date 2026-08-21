@@ -9,6 +9,7 @@ import numpy as np
 
 from tracker_eval.common.types import Box3D, Detection, FrameData
 from tracker_eval.trackers.base import TrackerBase, TrackerInfo, TrackerRunConfig
+from tracker_eval.trackers.paths import GNNPMB_CONFIG
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,7 @@ class GNNPMBConfig:
         Upstream special-case: if classification == 'pedestrian' and Z_k is empty,
         they call extractStates_with_custom_thr(filter_updated, thr=0.7).
     """
-    parameters_path: str = "/home/scai/trackers/GnnPmbTracker/configs/gnnpmb_parameters.json"
+    parameters_path: str = str(GNNPMB_CONFIG)
     classification: str = "pedestrian"
     use_nms: bool = True
 
@@ -124,9 +125,9 @@ class GNNPMBAdapter(TrackerBase):
           trackers.PMBMGNN.util module,
           utils.utils module
         """
-        from trackers.PMBMGNN import PMBMGNN_Filter_Point_Target as pmbmgnn_tracker  # type: ignore
-        from trackers.PMBMGNN import util as pmbmgnn_util  # type: ignore
-        from utils import utils as repo_utils  # type: ignore
+        from tracker_eval.trackers.implementations.gnnpmb.pmbmgnn import PMBMGNN_Filter_Point_Target as pmbmgnn_tracker
+        from tracker_eval.trackers.implementations.gnnpmb.pmbmgnn import util as pmbmgnn_util
+        from tracker_eval.trackers.implementations.gnnpmb import utils as repo_utils
         return pmbmgnn_tracker, pmbmgnn_util, repo_utils
 
     @staticmethod

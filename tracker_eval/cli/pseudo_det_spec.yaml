@@ -1,0 +1,104 @@
+# Controlled pseudo-detection specification for the RA-L analysis.
+#
+# The ten generated variants use stable, version-free names:
+#   clean
+#   dropout_L1, dropout_L2, dropout_L3
+#   instability_L1, instability_L2, instability_L3
+#   combined_L1, combined_L2, combined_L3
+#
+# Every detection is derived from the original GT pedestrian boxes and every
+# variant is evaluated against the unchanged standard GT. Scores use one common
+# deterministic realization across variants, so degradation differences are
+# caused only by the injected dropout or geometric-instability process.
+
+base:
+  fps: 15.0
+  class_name: pedestrian
+  severity: 1.0
+  # Use constant scores out of the box. Change to "sample" and provide
+  # --score_dists to reproduce a measured detector-score distribution.
+  score_mode: constant
+  score_dists: ""
+  score_value: 1.0
+
+single_mode_sweeps:
+
+  clean:
+    - name: default
+
+  dropout:
+    - name: L1
+      dropout_enable: true
+      dropout_p_start: 0.005
+      dropout_min_s: 0.05
+      dropout_max_s: 0.50
+
+    - name: L2
+      dropout_enable: true
+      dropout_p_start: 0.010
+      dropout_min_s: 0.05
+      dropout_max_s: 1.00
+
+    - name: L3
+      dropout_enable: true
+      dropout_p_start: 0.020
+      dropout_min_s: 0.05
+      dropout_max_s: 2.00
+
+  instability:
+    # Geometry only: one detection remains present on every GT frame. Each
+    # trajectory switches between persistent biased box hypotheses and also
+    # receives smaller independent frame-to-frame jitter.
+    - name: L1
+      instability_enable: true
+      instability_k_modes: 3
+      instability_p_switch: 0.05
+      instability_mode_xy_sigma_m: 0.03
+      instability_jitter_xy_sigma_m: 0.01
+      instability_mode_yaw_sigma_rad: 0.50
+      instability_jitter_yaw_sigma_rad: 0.10
+      instability_p_yaw_random: 0.0
+      instability_mode_lwh_sigma_rel: 0.03
+      instability_jitter_lwh_sigma_rel: 0.01
+
+    - name: L2
+      instability_enable: true
+      instability_k_modes: 4
+      instability_p_switch: 0.10
+      instability_mode_xy_sigma_m: 0.06
+      instability_jitter_xy_sigma_m: 0.02
+      instability_mode_yaw_sigma_rad: 0.80
+      instability_jitter_yaw_sigma_rad: 0.15
+      instability_p_yaw_random: 0.0
+      instability_mode_lwh_sigma_rel: 0.05
+      instability_jitter_lwh_sigma_rel: 0.02
+
+    - name: L3
+      instability_enable: true
+      instability_k_modes: 5
+      instability_p_switch: 0.20
+      instability_mode_xy_sigma_m: 0.10
+      instability_jitter_xy_sigma_m: 0.03
+      instability_mode_yaw_sigma_rad: 1.10
+      instability_jitter_yaw_sigma_rad: 0.20
+      instability_p_yaw_random: 0.0
+      instability_mode_lwh_sigma_rel: 0.08
+      instability_jitter_lwh_sigma_rel: 0.03
+
+combos:
+  # Symmetric severity combinations. The generator first perturbs the box
+  # geometry and then applies the corresponding dropout realization.
+  - name: combined_L1
+    use:
+      instability: L1
+      dropout: L1
+
+  - name: combined_L2
+    use:
+      instability: L2
+      dropout: L2
+
+  - name: combined_L3
+    use:
+      instability: L3
+      dropout: L3

@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     ap.add_argument("--out_root", required=True, type=str,
-                    help="tracker_eval output root (e.g. /mnt/nvme/tracker_eval_outputs or rsynced server folder)")
+                    help="tracker_eval output root (e.g. outputs or a copied server folder)")
     ap.add_argument("--tracker", required=True, type=str,
                     help="Tracker folder name inside out_root (e.g. ab3dmot, fastpoly, gnnpmb, cbmot, elptnet)")
     ap.add_argument("--sequence", required=True, type=str,
