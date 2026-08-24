@@ -41,7 +41,7 @@ The helper performs an out-of-source CMake build with the active Python interpre
 | `fastpoly` | yes | [lixiaoyu2000/FastPoly](https://github.com/lixiaoyu2000/FastPoly) |
 | `gnnpmb` | yes; build Murty once | [chisyliu/GnnPmbTracker](https://github.com/chisyliu/GnnPmbTracker) |
 | `simpletrack` | yes | [tusen-ai/SimpleTrack](https://github.com/tusen-ai/SimpleTrack) |
-| `pedreftrack` | yes | [Draxran/PedRefTrack](https://github.com/Draxran/PedRefTrack) |
+| `pedreftrack` | yes | [Draxran/PedRefTrack](https://github.com/SCAI-Lab/PedRefTrack) |
 
 These are compact protocol adapters and required runtime files, not forks intended to replace the upstream projects. Config files used by each adapter are retained in `tracker_eval/trackers/implementations/<tracker>/`.
 
