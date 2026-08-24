@@ -1,10 +1,14 @@
 # tracker_eval
 
-`tracker_eval` defines and implements a deployment-oriented evaluation protocol for 3D pedestrian tracking under fixed, shared detections. The protocol complements HOTA with directly interpretable, tracker-only success profiles that characterize trajectory initialization, continuation through missed detections, post-gap identity recovery, close-neighbour continuity, and tracker-step runtime as a function of input load. The repository provides the complete pipeline for running 3D trackers to generate trajectory outputs on JRDB dataset, evaluating them with the bundled corrected TrackEval runtime, computing the capability protocol using the success profile metrics, and plotting the saved results.
+**Deployment-oriented evaluation framework for 3D pedestrian multi-object tracking.**
 
-To make the protocol reproducible and usable out of the box, the repository includes compact, evaluation-oriented runtime subsets of seven example trackers: AB3DMOT, CBMOT, ELPTNet, FastPoly, GNN-PMB, SimpleTrack, and PedRefTrack. These implementations serve as ready-to-run reference methods for applying the protocol, they are not intended to replace the trackers’ full official repositories.
+`tracker_eval` provides a reproducible framework for benchmarking 3D pedestrian trackers under fixed, shared detections. In addition to standard metrics such as HOTA, it evaluates deployment-relevant tracker behavior through interpretable capability profiles covering trajectory initialization, continuation through missed detections, post-gap identity recovery, close-neighbour continuity, and tracker runtime under varying input load.
 
-The general ROS2 implementation of PedRefTrack is maintained separately at https://github.com/SCAI-Lab/PedRefTrack. This repository includes the same pure-Python tracking core together with a thin evaluation adapter, while the separate PedRefTrack repository provides the deployable ROS2 node operating on `Detection3DArray` messages.
+The repository contains the complete pipeline for running trackers on the JRDB dataset, generating trajectory outputs, evaluating them with the bundled corrected TrackEval runtime, computing the capability profiles, and visualizing the resulting metrics.
+
+For reproducible comparison, `tracker_eval` includes compact evaluation runtimes for seven trackers: AB3DMOT, CBMOT, ELPTNet, FastPoly, GNN-PMB, SimpleTrack, and PedRefTrack. These implementations are provided as ready-to-run reference methods for the evaluation protocol and are not intended to replace their respective upstream repositories.
+
+The deployable ROS 2 implementation of [PedRefTrack](https://github.com/SCAI-Lab/PedRefTrack) is maintained separately. `tracker_eval` contains the corresponding pure-Python tracking core and evaluation adapter, while the PedRefTrack repository provides the ROS 2 node for tracking `Detection3DArray` inputs.
 
 ## Installation
 
