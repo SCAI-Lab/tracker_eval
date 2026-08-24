@@ -1,10 +1,10 @@
 # tracker_eval
 
-`tracker_eval` is a self-contained research pipeline for running seven 3D pedestrian trackers on shared detections, exporting JRDB-compatible trajectories, evaluating them with the bundled corrected TrackEval runtime, computing the RA-L capability protocol, and plotting the saved results.
+`tracker_eval` defines and implements a deployment-oriented evaluation protocol for 3D pedestrian tracking under fixed, shared detections. The protocol complements HOTA with directly interpretable, tracker-only success profiles that characterize trajectory initialization, continuation through missed detections, post-gap identity recovery, close-neighbour continuity, and tracker-step runtime as a function of input load. The repository provides the complete pipeline for running 3D trackers to generate trajectory outputs on JRDB dataset, evaluating them with the bundled corrected TrackEval runtime, computing the capability protocol using the success profile metrics, and plotting the saved results.
 
-The repository includes compact evaluation-only runtime subsets of AB3DMOT, CBMOT, ELPTNet, FastPoly, GNN-PMB, SimpleTrack and PedRefTrack.
+To make the protocol reproducible and usable out of the box, the repository includes compact, evaluation-oriented runtime subsets of seven example trackers: AB3DMOT, CBMOT, ELPTNet, FastPoly, GNN-PMB, SimpleTrack, and PedRefTrack. These implementations serve as ready-to-run reference methods for applying the protocol, they are not intended to replace the trackers’ full official repositories.
 
-The general ROS2 implementation of this project's tracker is maintained separately at [Draxran/PedRefTrack](https://github.com/Draxran/PedRefTrack). The implementation here has the same pure-Python core plus a thin benchmark adapter; the separate repository provides the ROS2 `Detection3DArray` node.
+The general ROS2 implementation of PedRefTrack is maintained separately at https://github.com/SCAI-Lab/PedRefTrack. This repository includes the same pure-Python tracking core together with a thin evaluation adapter, while the separate PedRefTrack repository provides the deployable ROS2 node operating on `Detection3DArray` messages.
 
 ## Installation
 
@@ -228,6 +228,16 @@ tracker-eval-protocol capabilities \
 ```
 
 This command builds/reuses common event caches, per-tracker capability/HOTA caches and final tables. The internal modules are `protocol/hota_cache.py`, `profiles.py` and `results.py`; users should normally call only `tracker-eval-protocol`.
+
+The public command defaults to the corrected two-second RAL protocol:
+
+- gap prediction is evaluated through `2.0` seconds;
+- recovery bins are `1,4,7,10,13,16,19,22,25,28,31` frames;
+- the remaining IoU, continuity, initialization, NN-bin, quantile and bootstrap defaults match the settings used for the corrected RAL tables.
+
+`tables/initialization_latency_summary.csv` contains all initialization views in one run. Use `event_type == "trajectory_start"` for genuine trajectory initialization only, or `event_type == "all"` for trajectory initialization plus post-gap reacquisition when all evaluated trackers already lost the trajectory. The plotting notebook exposes this as `INITIALIZATION_EVENT_TYPE`; it does not require rerunning the protocol.
+
+Changing a protocol-defining setting for an existing output directory is rejected to protect cached results. Use a new output directory, or pass `--force` when replacement of the old protocol cache is intentional.
 
 Plot saved results by opening:
 

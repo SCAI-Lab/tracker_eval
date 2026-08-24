@@ -132,6 +132,16 @@ tracker-eval-protocol capabilities \
 
 Add `--recompute-trackers name1,name2` to refresh selected caches or `--force` after changing protocol-defining settings.
 
+The capability command uses the corrected RAL defaults: a `2.0` s gap horizon and recovery-bin edges `1,4,7,10,13,16,19,22,25,28,31`. These and the other scientific protocol settings are exposed as optional arguments on `tracker-eval-protocol capabilities`; they do not need to be repeated for the standard evaluation.
+
+The initialization table already provides both requested populations:
+
+- `event_type == "trajectory_start"`: initial trajectory establishment only;
+- `event_type == "all"`: initial establishment plus post-gap reacquisition;
+- `event_type == "post_gap_reacquisition"`: reacquisition alone, retained for diagnostics.
+
+Set `INITIALIZATION_EVENT_TYPE` in `notebooks/plot_tracker_results.ipynb` to select the plotted population. Both views are calculated in the same protocol run.
+
 ## 9. Plots
 
 ```bash

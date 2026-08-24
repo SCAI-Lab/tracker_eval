@@ -1071,8 +1071,16 @@ def precompute_hota_event_sequence(
     matchable_sim_thr: float,
     output_path: Path,
     force: bool,
+    preprocessed_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compute one tracker/sequence's bin-independent HOTA event representation."""
+    """Compute one tracker/sequence's bin-independent HOTA event representation.
+
+    ``preprocessed_data`` is an optional in-process reuse hook.  Capability
+    profiling already needs the same TrackEval-preprocessed sequence for its
+    fixed-threshold assignments, so accepting it avoids loading and computing
+    corrected 3D similarities twice.  Omitting it preserves the standalone
+    helper's original behavior.
+    """
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -1083,16 +1091,19 @@ def precompute_hota_event_sequence(
     add_trackeval_to_path(trackeval_root)
     import trackeval  # noqa: E402
 
-    dataset = make_dataset(
-        trackeval,
-        trackers_base_dir,
-        gt_folder,
-        tracker,
-        split_to_eval,
-        tracker_sub_folder,
-        matchable_sim_thr,
-    )
-    data = load_preprocessed_sequence(dataset, tracker, seq)
+    if preprocessed_data is None:
+        dataset = make_dataset(
+            trackeval,
+            trackers_base_dir,
+            gt_folder,
+            tracker,
+            split_to_eval,
+            tracker_sub_folder,
+            matchable_sim_thr,
+        )
+        data = load_preprocessed_sequence(dataset, tracker, seq)
+    else:
+        data = preprocessed_data
     alpha_labels = np.asarray(trackeval.metrics.HOTA().array_labels, dtype=np.float64)
     n_alpha = len(alpha_labels)
     n_t = int(data["num_timesteps"])

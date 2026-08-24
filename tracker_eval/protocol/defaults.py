@@ -1,0 +1,31 @@
+"""Canonical defaults for the public tracker capability protocol.
+
+These values reproduce the settings used for the corrected two-second RAL
+evaluation.  Keeping them in one module prevents the public wrapper and the
+two internal stages from silently drifting apart.
+"""
+
+FPS = 15.0
+SUCCESS_IOU_THRESHOLD = 0.30
+MATCHABLE_SIMILARITY_THRESHOLD = 0.30
+PRE_GAP_VISIBLE_FRAMES = 8
+
+MAX_GAP_AGE_SECONDS = 2.0
+RECOVERY_GAP_BIN_EDGES_FRAMES = "1,4,7,10,13,16,19,22,25,28,31"
+
+CONTINUITY_MAX_DETECTOR_GAP_FRAMES = 3
+CONTINUITY_WARMUP_FRAMES = 8
+CONTINUITY_CHUNK_SECONDS = 1.0
+CONTINUITY_MIN_NN_FRAMES = 3
+
+INITIALIZATION_MAX_SECONDS = 0.50
+INITIALIZATION_VALIDATION_SECONDS = 1.00
+
+NN_MIN_METERS = 0.0
+NN_MAX_METERS = 1.0
+NN_BIN_WIDTH_METERS = 0.10
+
+HOTA_SPREAD_QUANTILES = "0.10,0.90"
+PROFILE_CI_QUANTILES = "0.025,0.975"
+BOOTSTRAP_REPLICATES = 2000
+RUNTIME_MIN_FRAMES_PER_COUNT = 1

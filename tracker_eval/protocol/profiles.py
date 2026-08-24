@@ -51,12 +51,17 @@ common/sequences/<seq>.npz
     Tracker-independent GT/detector observations and event definitions.
 profiles/<tracker>/<seq>.csv.gz
     Per-sequence aggregate counts for all direct success/failure profiles.
+assignment_observations/<tracker>/<seq>.npz
+    Exact fixed-threshold framewise GT-to-original-tracker-ID assignments,
+    reused by final table construction and initialization/re-acquisition.
 hota_events/<tracker>/<seq>.npz
     Cached full-sequence HOTA matching/association sufficient statistics.
     These are generated from current tracker outputs and used for both
     per-sequence and globally combined HOTA/decomposition tables.
 
-Adding trackers computes only their missing profile and HOTA-event caches.
+Adding trackers computes only their missing profile, assignment and HOTA-event
+caches. The preprocessed TrackEval sequence is shared in-process between HOTA
+and fixed-threshold assignment construction.
 Use --recompute-trackers to refresh selected tracker outputs. Common event
 caches are reusable as long as their metadata signature is unchanged.
 
@@ -78,6 +83,7 @@ import importlib.util
 import json
 import math
 import os
+import shutil
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -90,6 +96,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
+from tracker_eval.protocol import defaults
+
 try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover
@@ -98,6 +106,7 @@ except Exception:  # pragma: no cover
 
 SCRIPT_VERSION = "tracker_eval_protocol"
 CACHE_VERSION = "tracker_eval_cache"
+ASSIGNMENT_CACHE_VERSION = 1
 
 TRACKER_LABELS = {
     "pedreftrack__global_gt_assisted": "GT-assisted PedRefTrack",
@@ -680,12 +689,158 @@ def local_gt_to_tracker_assignments(data: dict, threshold: float) -> list[dict[i
     return assignments
 
 
+def assignment_observation_payload(
+    common: dict[str, np.ndarray],
+    assignments: list[dict[int, int]],
+) -> dict[str, np.ndarray]:
+    """Flatten frame assignments into the cache consumed by final results.
+
+    The expensive operation is the per-frame 3D-IoU/Hungarian matching that
+    creates ``assignments``.  Persisting its exact output here lets later
+    protocol stages derive additional event tables without loading TrackEval
+    data or repeating that matching.
+    """
+    offsets = np.asarray(common["frame_gt_offsets"], dtype=np.int64)
+    gids_flat = np.asarray(common["gt_internal_ids_flat"], dtype=np.int32)
+    frame_flat = np.asarray(common["frame_indices_flat"], dtype=np.int32)
+    n_frames = int(np.asarray(common["num_timesteps"]).reshape(-1)[0])
+    if len(assignments) != n_frames:
+        raise RuntimeError(
+            "Assignment frame count does not match common cache: "
+            f"assignments={len(assignments)}, common={n_frames}"
+        )
+    if len(offsets) != n_frames + 1 or int(offsets[-1]) != len(gids_flat):
+        raise RuntimeError("Malformed common-cache frame offsets")
+
+    assigned_tracker_id = np.full(len(gids_flat), -1, dtype=np.int64)
+    for frame, mapping in enumerate(assignments):
+        start, end = int(offsets[frame]), int(offsets[frame + 1])
+        flat_by_gid = {
+            int(gid): start + local
+            for local, gid in enumerate(gids_flat[start:end])
+        }
+        for gid, tracker_id in mapping.items():
+            flat = flat_by_gid.get(int(gid))
+            if flat is None:
+                raise RuntimeError(
+                    "Assignment references an unknown GT internal ID: "
+                    f"frame={frame}, gid={gid}"
+                )
+            assigned_tracker_id[flat] = int(tracker_id)
+
+    return {
+        "cache_version": np.asarray(
+            [ASSIGNMENT_CACHE_VERSION], dtype=np.int16
+        ),
+        "num_timesteps": np.asarray([n_frames], dtype=np.int64),
+        "frame_gt_offsets": offsets,
+        "gt_internal_ids_flat": gids_flat,
+        "frame_indices_flat": frame_flat,
+        "assigned_tracker_orig_id_flat": assigned_tracker_id,
+    }
+
+
+def write_assignment_observation(
+    path: Path,
+    common: dict[str, np.ndarray],
+    assignments: list[dict[int, int]],
+) -> None:
+    """Atomically save reusable GT-to-original-tracker-ID assignments."""
+    atomic_npz(path, assignment_observation_payload(common, assignments))
+
+
+def load_assignment_mappings(
+    path: Path,
+    common: dict[str, np.ndarray],
+) -> list[dict[int, int]]:
+    """Load and structurally validate a reusable assignment observation."""
+    payload = load_npz(path)
+    required = {
+        "cache_version",
+        "num_timesteps",
+        "frame_gt_offsets",
+        "gt_internal_ids_flat",
+        "frame_indices_flat",
+        "assigned_tracker_orig_id_flat",
+    }
+    missing = required - set(payload)
+    if missing:
+        raise KeyError(f"Assignment cache lacks {sorted(missing)}")
+    version = int(np.asarray(payload["cache_version"]).reshape(-1)[0])
+    if version != ASSIGNMENT_CACHE_VERSION:
+        raise RuntimeError(
+            f"Unsupported assignment cache version {version}; "
+            f"expected {ASSIGNMENT_CACHE_VERSION}"
+        )
+    for key in (
+        "frame_gt_offsets",
+        "gt_internal_ids_flat",
+        "frame_indices_flat",
+    ):
+        if not np.array_equal(payload[key], common[key]):
+            raise RuntimeError(f"Assignment/common mismatch for {key}")
+
+    assigned = np.asarray(
+        payload["assigned_tracker_orig_id_flat"], dtype=np.int64
+    )
+    gids_flat = np.asarray(common["gt_internal_ids_flat"], dtype=np.int32)
+    offsets = np.asarray(common["frame_gt_offsets"], dtype=np.int64)
+    n_frames = int(np.asarray(common["num_timesteps"]).reshape(-1)[0])
+    if len(assigned) != len(gids_flat) or len(offsets) != n_frames + 1:
+        raise RuntimeError("Malformed assignment cache")
+
+    mappings: list[dict[int, int]] = []
+    for frame in range(n_frames):
+        start, end = int(offsets[frame]), int(offsets[frame + 1])
+        mappings.append(
+            {
+                int(gid): int(tracker_id)
+                for gid, tracker_id in zip(
+                    gids_flat[start:end], assigned[start:end]
+                )
+                if int(tracker_id) >= 0
+            }
+        )
+    return mappings
+
+
+def reuse_assignment_observation(
+    *,
+    source_root: Path | None,
+    destination: Path,
+    common: dict[str, np.ndarray],
+    tracker: str,
+    sequence: str,
+) -> str | None:
+    """Migrate a compatible final-results assignment into stage 1."""
+    if destination.exists() or source_root is None:
+        return None
+    source = (
+        Path(source_root)
+        / safe_tracker_name(tracker)
+        / f"{sequence}.npz"
+    )
+    if not source.is_file():
+        return None
+    # Validate before linking so an old or incompatible cache cannot silently
+    # become the canonical first-stage assignment source.
+    load_assignment_mappings(source, common)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination)
+        return "reused_hardlink"
+    except OSError:
+        shutil.copy2(source, destination)
+        return "reused_copy"
+
+
 def ensure_hota_event(
     helper,
     payload: dict[str, Any],
     tracker: str,
     seq: str,
     destination: Path,
+    preprocessed_data: dict[str, Any] | None = None,
 ) -> str:
     if destination.exists() and not payload["force_tracker"]:
         return "cached"
@@ -711,6 +866,7 @@ def ensure_hota_event(
         matchable_sim_thr=float(payload["matchable_sim_thr"]),
         output_path=destination,
         force=bool(payload["force_tracker"]),
+        preprocessed_data=preprocessed_data,
     )
     return str(result["status"])
 
@@ -812,33 +968,75 @@ def _tracker_sequence_worker(payload: dict[str, Any]) -> dict[str, Any]:
     tracker_safe = safe_tracker_name(tracker)
     destination = Path(payload["profile_dir"]) / tracker_safe / f"{seq}.csv.gz"
     event_path = Path(payload["hota_event_dir"]) / tracker_safe / f"{seq}.npz"
+    assignment_path = (
+        Path(payload["assignment_dir"])
+        / tracker_safe
+        / f"{seq}.npz"
+    )
+    force_tracker = bool(payload["force_tracker"])
+    profile_needed = bool(force_tracker or not destination.exists())
+    common = load_npz(
+        Path(payload["common_dir"]) / "sequences" / f"{seq}.npz"
+    )
+    reuse_root_value = payload.get("reuse_assignment_observations_from")
+    assignment_reuse_status = (
+        None
+        if force_tracker
+        else reuse_assignment_observation(
+            source_root=(
+                Path(reuse_root_value) if reuse_root_value else None
+            ),
+            destination=assignment_path,
+            common=common,
+            tracker=tracker,
+            sequence=seq,
+        )
+    )
+    assignment_needed = bool(force_tracker or not assignment_path.exists())
 
     helper = load_helper(Path(payload["helper_script"]))
     helper.add_trackeval_to_path(Path(payload["trackeval_root"]))
-    import trackeval  # noqa: WPS433
 
-    event_status = ensure_hota_event(helper, payload, tracker, seq, event_path)
-    if destination.exists() and not payload["force_tracker"]:
+    # A clean tracker cache needs the same preprocessed TrackEval sequence for
+    # both HOTA-event construction and fixed-threshold capability assignment.
+    # Load it once and pass it into the HOTA helper instead of preprocessing
+    # the sequence independently in both calculations.
+    data: dict[str, Any] | None = None
+    if assignment_needed:
+        import trackeval  # noqa: WPS433
+
+        dataset = helper.make_dataset(
+            trackeval,
+            Path(payload["trackers_base_dir"]),
+            Path(payload["gt_folder"]),
+            tracker,
+            str(payload["split_to_eval"]),
+            str(payload["tracker_sub_folder"]),
+            float(payload["matchable_sim_thr"]),
+        )
+        data = helper.load_preprocessed_sequence(dataset, tracker, seq)
+
+    event_status = ensure_hota_event(
+        helper,
+        payload,
+        tracker,
+        seq,
+        event_path,
+        preprocessed_data=data,
+    )
+    if not profile_needed and not assignment_needed:
         return {
             "tracker": tracker,
             "seq": seq,
             "status": "cached",
             "hota_event_status": event_status,
+            "profile_status": "cached",
+            "assignment_status": (
+                assignment_reuse_status or "cached"
+            ),
         }
 
-    dataset = helper.make_dataset(
-        trackeval,
-        Path(payload["trackers_base_dir"]),
-        Path(payload["gt_folder"]),
-        tracker,
-        str(payload["split_to_eval"]),
-        str(payload["tracker_sub_folder"]),
-        float(payload["matchable_sim_thr"]),
-    )
-    data = helper.load_preprocessed_sequence(dataset, tracker, seq)
-    common = load_npz(Path(payload["common_dir"]) / "sequences" / f"{seq}.npz")
-
-    n_t = int(data["num_timesteps"])
+    n_t = int(np.asarray(common["num_timesteps"]).reshape(-1)[0])
     frame_offsets = np.asarray(common["frame_gt_offsets"], dtype=np.int64)
     gt_ids_flat = np.asarray(common["gt_internal_ids_flat"], dtype=np.int32)
     frame_flat = np.asarray(common["frame_indices_flat"], dtype=np.int32)
@@ -856,19 +1054,50 @@ def _tracker_sequence_worker(payload: dict[str, Any]) -> dict[str, Any]:
     )
     visible_run_flat = np.asarray(common["detector_visible_run_flat"], dtype=np.int16)
 
-    expected_offsets = np.asarray(
-        np.concatenate([[0], np.cumsum([len(x) for x in data["gt_ids"]])]),
-        dtype=np.int64,
-    )
-    if not np.array_equal(frame_offsets, expected_offsets):
-        raise RuntimeError(f"Tracker/common frame offsets differ for {tracker}:{seq}")
-
     frame_to_flat: list[dict[int, int]] = []
     for frame in range(n_t):
         start, end = int(frame_offsets[frame]), int(frame_offsets[frame + 1])
         frame_to_flat.append({int(gid): start + local for local, gid in enumerate(gt_ids_flat[start:end])})
 
-    gt_to_track = local_gt_to_tracker_assignments(data, float(payload["success_iou_thr"]))
+    if not assignment_needed:
+        gt_to_track = load_assignment_mappings(assignment_path, common)
+        assignment_status = assignment_reuse_status or "cached"
+    else:
+        if data is None:  # Defensive; assignment_needed loaded it above.
+            raise RuntimeError("Missing preprocessed tracker sequence")
+        expected_offsets = np.asarray(
+            np.concatenate(
+                [[0], np.cumsum([len(x) for x in data["gt_ids"]])]
+            ),
+            dtype=np.int64,
+        )
+        if (
+            int(data["num_timesteps"]) != n_t
+            or not np.array_equal(frame_offsets, expected_offsets)
+        ):
+            raise RuntimeError(
+                f"Tracker/common frame offsets differ for {tracker}:{seq}"
+            )
+        gt_to_track = local_gt_to_tracker_assignments(
+            data,
+            float(payload["success_iou_thr"]),
+        )
+        write_assignment_observation(
+            assignment_path,
+            common,
+            gt_to_track,
+        )
+        assignment_status = "computed"
+    if not profile_needed:
+        return {
+            "tracker": tracker,
+            "seq": seq,
+            "status": "computed_assignment_only",
+            "hota_event_status": event_status,
+            "profile_status": "cached",
+            "assignment_status": assignment_status,
+        }
+
     max_gap_age_frames = int(payload["max_gap_age_frames"])
     pre_gap_visible_frames = int(payload["pre_gap_visible_frames"])
     nn_edges = list(payload["nn_edges"])
@@ -1087,8 +1316,10 @@ def _tracker_sequence_worker(payload: dict[str, Any]) -> dict[str, Any]:
     # Fixed non-overlapping windows avoid counting every overlapping slice of a
     # long easy run. The close-encounter window is binned by its minimum raw
     # detector NN separation; the jitter window by its P90 detector-error step.
-    n_gt_ids = int(data["num_gt_ids"])
-    for gid in range(n_gt_ids):
+    # Internal GT IDs are stable in the common cache; iterating the observed
+    # IDs is equivalent to the previous TrackEval-derived range and also works
+    # when this profile is resumed from an assignment cache alone.
+    for gid in np.unique(gt_ids_flat).astype(int).tolist():
         visible_frames: list[int] = []
 
         def consume_visible_run(run: list[int]) -> None:
@@ -1192,6 +1423,8 @@ def _tracker_sequence_worker(payload: dict[str, Any]) -> dict[str, Any]:
         "status": "computed",
         "rows": len(profile_frame),
         "hota_event_status": event_status,
+        "profile_status": "computed",
+        "assignment_status": assignment_status,
     }
 
 
@@ -2162,6 +2395,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Omit this to calculate HOTA events freshly from current tracker outputs."
         ),
     )
+    parser.add_argument(
+        "--reuse-assignment-observations-from",
+        type=Path,
+        default=None,
+        help=(
+            "Optional compatible assignment cache used to migrate results "
+            "created before stage 1 persisted its own assignments."
+        ),
+    )
     parser.add_argument("--trackers", type=str, required=True)
     parser.add_argument("--reference-tracker", type=str, required=True)
     parser.add_argument("--global-plot-trackers", type=str, default=None)
@@ -2173,11 +2415,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plot-only", action="store_true")
     parser.add_argument("--split-to-eval", type=str, default="test")
     parser.add_argument("--tracker-sub-folder", type=str, default="data")
-    parser.add_argument("--fps", type=float, default=15.0)
-    parser.add_argument("--pre-gap-visible-frames", type=int, default=8)
-    parser.add_argument("--max-gap-age-s", type=float, default=1.0)
-    parser.add_argument("--success-iou-thr", type=float, default=0.30)
-    parser.add_argument("--matchable-sim-thr", type=float, default=0.30)
+    parser.add_argument("--fps", type=float, default=defaults.FPS)
+    parser.add_argument(
+        "--pre-gap-visible-frames",
+        type=int,
+        default=defaults.PRE_GAP_VISIBLE_FRAMES,
+    )
+    parser.add_argument(
+        "--max-gap-age-s",
+        type=float,
+        default=defaults.MAX_GAP_AGE_SECONDS,
+    )
+    parser.add_argument(
+        "--success-iou-thr",
+        type=float,
+        default=defaults.SUCCESS_IOU_THRESHOLD,
+    )
+    parser.add_argument(
+        "--matchable-sim-thr",
+        type=float,
+        default=defaults.MATCHABLE_SIMILARITY_THRESHOLD,
+    )
     parser.add_argument("--det-match-max-dist-m", type=float, default=0.30)
     parser.add_argument("--det-score-min", type=float, default=None)
     parser.add_argument(
@@ -2201,8 +2459,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--recovery-gap-bin-edges-frames",
         type=str,
-        default="1,4,7,10,13,16",
-        help="Half-open total-gap bins; default gives 1-3,...,13-15 frames.",
+        default=defaults.RECOVERY_GAP_BIN_EDGES_FRAMES,
+        help=(
+            "Half-open total-gap bins; the default gives 1-3,...,28-30 "
+            "frames and matches the corrected two-second RAL evaluation."
+        ),
     )
     parser.add_argument(
         "--encounter-window-frames",
@@ -2219,11 +2480,15 @@ def build_parser() -> argparse.ArgumentParser:
             "least this value (or no matched neighbour exists) at both frames."
         ),
     )
-    parser.add_argument("--hota-spread-quantiles", type=str, default="0.10,0.90")
+    parser.add_argument(
+        "--hota-spread-quantiles",
+        type=str,
+        default=defaults.HOTA_SPREAD_QUANTILES,
+    )
     parser.add_argument(
         "--bootstrap-replicates",
         type=int,
-        default=2000,
+        default=defaults.BOOTSTRAP_REPLICATES,
         help="Sequence-cluster bootstrap replicates for direct-profile intervals.",
     )
     parser.add_argument(
@@ -2234,11 +2499,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile-ci-quantiles",
         type=str,
-        default="0.025,0.975",
+        default=defaults.PROFILE_CI_QUANTILES,
         help="Two quantiles for sequence-cluster bootstrap intervals.",
     )
     parser.add_argument("--realtime-fps", type=float, default=10.0)
-    parser.add_argument("--runtime-min-frames-per-count", type=int, default=1)
+    parser.add_argument(
+        "--runtime-min-frames-per-count",
+        type=int,
+        default=defaults.RUNTIME_MIN_FRAMES_PER_COUNT,
+    )
     parser.add_argument("--num-workers", type=int, default=1)
     return parser
 
@@ -2311,12 +2580,14 @@ def main() -> int:
     common_dir = output_dir / "common"
     profile_dir = output_dir / "profiles"
     hota_event_dir = output_dir / "hota_events"
+    assignment_dir = output_dir / "assignment_observations"
     tables_dir = output_dir / "tables"
     figures_dir = output_dir / "figures"
     for directory in (
         common_dir / "sequences",
         profile_dir,
         hota_event_dir,
+        assignment_dir,
         tables_dir,
         figures_dir,
     ):
@@ -2424,9 +2695,15 @@ def main() -> int:
                     "common_dir": str(common_dir),
                     "profile_dir": str(profile_dir),
                     "hota_event_dir": str(hota_event_dir),
+                    "assignment_dir": str(assignment_dir),
                     "reuse_hota_events_from": (
                         str(args.reuse_hota_events_from.resolve())
                         if args.reuse_hota_events_from
+                        else None
+                    ),
+                    "reuse_assignment_observations_from": (
+                        str(args.reuse_assignment_observations_from.resolve())
+                        if args.reuse_assignment_observations_from
                         else None
                     ),
                     "tracker": tracker,
@@ -2610,7 +2887,13 @@ def main() -> int:
             if args.reuse_hota_events_from
             else None
         ),
+        "reuse_assignment_observations_from": (
+            str(args.reuse_assignment_observations_from.resolve())
+            if args.reuse_assignment_observations_from
+            else None
+        ),
         "output_files": {
+            "assignment_observations": str(assignment_dir),
             "global_hota_metrics": str(tables_dir / "global_hota_metrics.csv"),
             "hota_per_sequence": str(tables_dir / "hota_per_sequence.csv"),
             "global_metric_gap_to_reference": str(
@@ -2652,7 +2935,10 @@ def main() -> int:
         },
     }
     atomic_json(output_dir / "run_metadata.json", run_metadata)
-    print(f"Finished. Results written to: {output_dir}")
+    print(
+        "Capability cache stage finished. "
+        f"Intermediate results written to: {output_dir}"
+    )
     return 0
 
 

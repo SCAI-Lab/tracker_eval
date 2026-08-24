@@ -23,11 +23,13 @@ run, the script:
 No figures are produced. The notebook can load the resulting tables from
 ``OUTPUT_DIR/tables`` without running TrackEval or tracker evaluation.
 
-The capability profiles use a fresh per-frame Hungarian assignment on raw
-TrackEval 3D similarity. Event populations are defined only from GT and the
-shared detector cache, so every tracker receives the same population. Global
-HOTA is computed from selected tracker outputs through per-sequence HOTA event
-caches; exported TrackEval result CSVs are never used as metric inputs.
+The capability profiles use the exact per-frame Hungarian assignment on raw
+TrackEval 3D similarity persisted by the preceding profile stage. Older or
+incomplete caches fall back to computing the same assignment locally. Event
+populations are defined only from GT and the shared detector cache, so every
+tracker receives the same population. Global HOTA is computed from selected
+tracker outputs through per-sequence HOTA event caches; exported TrackEval
+result CSVs are never used as metric inputs.
 
 Compatible caches are reused when their protocol-defining settings match.
 Tracker membership, reference
@@ -46,6 +48,7 @@ import importlib.util
 import json
 import math
 import os
+import shutil
 import sys
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -54,6 +57,8 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+
+from tracker_eval.protocol import defaults
 
 
 SCRIPT_VERSION = "tracker_eval_protocol"
@@ -381,11 +386,9 @@ def _direct_tracker_sequence_worker(payload: dict[str, Any]) -> dict[str, Any]:
     )
     force_tracker = bool(payload["force_tracker"])
     profile_needed = bool(force_tracker or not destination.exists())
-    assignment_needed = bool(force_tracker or not assignment_path.exists())
     profiles_module = load_module(Path(payload["profiles_script"]), "ral_profiles")
     helper = profiles_module.load_helper(Path(payload["hota_cache_script"]))
     helper.add_trackeval_to_path(Path(payload["trackeval_root"]))
-    import trackeval  # noqa: WPS433
 
     hota_path = (
         Path(payload["hota_event_dir"])
@@ -409,33 +412,13 @@ def _direct_tracker_sequence_worker(payload: dict[str, Any]) -> dict[str, Any]:
         sequence,
         hota_path,
     )
-    if not profile_needed and not assignment_needed:
-        return {
-            "tracker": tracker,
-            "seq": sequence,
-            "status": "cached",
-            "hota_event_status": event_status,
-            "profile_status": "cached",
-            "assignment_status": "cached",
-        }
-
-    dataset = helper.make_dataset(
-        trackeval,
-        Path(payload["trackers_base_dir"]),
-        Path(payload["gt_folder"]),
-        tracker,
-        str(payload["split_to_eval"]),
-        str(payload["tracker_sub_folder"]),
-        float(payload["matchable_sim_thr"]),
-    )
-    data = helper.load_preprocessed_sequence(dataset, tracker, sequence)
     common = load_npz(
         Path(payload["common_dir"]) / "sequences" / f"{sequence}.npz"
     )
     chunks_path = Path(payload["chunk_dir"]) / f"{sequence}.csv.gz"
     chunks = pd.read_csv(chunks_path) if chunks_path.exists() else pd.DataFrame()
 
-    n_frames = int(data["num_timesteps"])
+    n_frames = int(np.asarray(common["num_timesteps"]).reshape(-1)[0])
     offsets = np.asarray(common["frame_gt_offsets"], dtype=np.int64)
     gids_flat = np.asarray(common["gt_internal_ids_flat"], dtype=np.int32)
     frame_flat = np.asarray(common["frame_indices_flat"], dtype=np.int32)
@@ -445,14 +428,6 @@ def _direct_tracker_sequence_worker(payload: dict[str, Any]) -> dict[str, Any]:
         common["detector_visible_run_flat"],
         dtype=np.int16,
     )
-    expected_offsets = np.concatenate(
-        [[0], np.cumsum([len(ids) for ids in data["gt_ids"]])]
-    ).astype(np.int64)
-    if not np.array_equal(offsets, expected_offsets):
-        raise RuntimeError(
-            f"{tracker}:{sequence}: tracker/common frame offsets differ"
-        )
-
     frame_to_flat: list[dict[int, int]] = []
     for frame in range(n_frames):
         start, end = int(offsets[frame]), int(offsets[frame + 1])
@@ -462,51 +437,74 @@ def _direct_tracker_sequence_worker(payload: dict[str, Any]) -> dict[str, Any]:
                 for local, gid in enumerate(gids_flat[start:end])
             }
         )
-    assignments = profiles_module.local_gt_to_tracker_assignments(
-        data,
-        float(payload["success_iou_thr"]),
+    reuse_root_value = payload.get("reuse_assignment_observations_from")
+    assignment_status = reuse_assignment_observation(
+        source_root=(Path(reuse_root_value) if reuse_root_value else None),
+        destination=assignment_path,
+        common=common,
+        tracker=tracker,
+        sequence=sequence,
+        force=force_tracker,
     )
-
-    if assignment_needed:
-        assigned_tracker_id = np.full(len(gids_flat), -1, dtype=np.int64)
-        for frame, mapping in enumerate(assignments):
-            for gid, tracker_id in mapping.items():
-                flat = frame_to_flat[frame].get(int(gid))
-                if flat is None:
-                    raise RuntimeError(
-                        f"{tracker}:{sequence}: assignment references "
-                        f"unknown GT internal ID {gid} at frame {frame}"
-                    )
-                assigned_tracker_id[flat] = int(tracker_id)
-        atomic_npz(
-            assignment_path,
-            {
-                "cache_version": np.asarray(
-                    [ASSIGNMENT_CACHE_VERSION],
-                    dtype=np.int16,
-                ),
-                "num_timesteps": np.asarray([n_frames], dtype=np.int64),
-                "frame_gt_offsets": offsets.astype(np.int64, copy=False),
-                "gt_internal_ids_flat": gids_flat.astype(
-                    np.int32,
-                    copy=False,
-                ),
-                "frame_indices_flat": frame_flat.astype(
-                    np.int32,
-                    copy=False,
-                ),
-                "assigned_tracker_orig_id_flat": assigned_tracker_id,
-            },
+    if assignment_status is not None:
+        assigned_tracker_id = load_assignment_observation(
+            path=assignment_path,
+            common=common,
+            tracker=tracker,
+            sequence=sequence,
         )
+        assignments = assignment_mappings_from_observation(
+            assigned=assigned_tracker_id,
+            common=common,
+        )
+    else:
+        # Compatibility fallback for old/incomplete caches. This is the only
+        # path that reloads TrackEval data and performs the expensive matching.
+        import trackeval  # noqa: WPS433
+
+        dataset = helper.make_dataset(
+            trackeval,
+            Path(payload["trackers_base_dir"]),
+            Path(payload["gt_folder"]),
+            tracker,
+            str(payload["split_to_eval"]),
+            str(payload["tracker_sub_folder"]),
+            float(payload["matchable_sim_thr"]),
+        )
+        data = helper.load_preprocessed_sequence(dataset, tracker, sequence)
+        expected_offsets = np.concatenate(
+            [[0], np.cumsum([len(ids) for ids in data["gt_ids"]])]
+        ).astype(np.int64)
+        if (
+            int(data["num_timesteps"]) != n_frames
+            or not np.array_equal(offsets, expected_offsets)
+        ):
+            raise RuntimeError(
+                f"{tracker}:{sequence}: tracker/common frame offsets differ"
+            )
+        assignments = profiles_module.local_gt_to_tracker_assignments(
+            data,
+            float(payload["success_iou_thr"]),
+        )
+        profiles_module.write_assignment_observation(
+            assignment_path,
+            common,
+            assignments,
+        )
+        assignment_status = "computed"
 
     if not profile_needed:
         return {
             "tracker": tracker,
             "seq": sequence,
-            "status": "computed_assignment_only",
+            "status": (
+                "cached"
+                if assignment_status == "cached"
+                else "prepared_assignment_only"
+            ),
             "hota_event_status": event_status,
             "profile_status": "cached",
-            "assignment_status": "computed",
+            "assignment_status": assignment_status,
         }
 
     max_gap_age_frames = int(payload["max_gap_age_frames"])
@@ -641,9 +639,7 @@ def _direct_tracker_sequence_worker(payload: dict[str, Any]) -> dict[str, Any]:
         "status": "computed",
         "hota_event_status": event_status,
         "profile_status": "computed",
-        "assignment_status": (
-            "computed" if assignment_needed else "cached"
-        ),
+        "assignment_status": assignment_status,
     }
 
 
@@ -909,6 +905,81 @@ def load_assignment_observation(
             f"{tracker}:{sequence}: malformed flat assignment length"
         )
     return assigned
+
+
+def assignment_mappings_from_observation(
+    *,
+    assigned: np.ndarray,
+    common: dict[str, np.ndarray],
+) -> list[dict[int, int]]:
+    """Expand a flat reusable assignment cache into frame dictionaries."""
+    offsets = np.asarray(common["frame_gt_offsets"], dtype=np.int64)
+    gids_flat = np.asarray(common["gt_internal_ids_flat"], dtype=np.int32)
+    n_frames = int(np.asarray(common["num_timesteps"]).reshape(-1)[0])
+    if len(offsets) != n_frames + 1:
+        raise RuntimeError("Malformed common-cache frame offsets")
+
+    mappings: list[dict[int, int]] = []
+    for frame in range(n_frames):
+        start, end = int(offsets[frame]), int(offsets[frame + 1])
+        mappings.append(
+            {
+                int(gid): int(tracker_id)
+                for gid, tracker_id in zip(
+                    gids_flat[start:end],
+                    assigned[start:end],
+                )
+                if int(tracker_id) >= 0
+            }
+        )
+    return mappings
+
+
+def reuse_assignment_observation(
+    *,
+    source_root: Path | None,
+    destination: Path,
+    common: dict[str, np.ndarray],
+    tracker: str,
+    sequence: str,
+    force: bool,
+) -> str | None:
+    """Hard-link a validated first-stage assignment cache when available."""
+    if destination.exists() and not force:
+        load_assignment_observation(
+            path=destination,
+            common=common,
+            tracker=tracker,
+            sequence=sequence,
+        )
+        return "cached"
+    if source_root is None:
+        return None
+
+    source = (
+        Path(source_root)
+        / safe_name(tracker)
+        / f"{sequence}.npz"
+    )
+    if not source.is_file():
+        return None
+    load_assignment_observation(
+        path=source,
+        common=common,
+        tracker=tracker,
+        sequence=sequence,
+    )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        destination.unlink()
+    try:
+        os.link(source, destination)
+        status = "reused_hardlink"
+    except OSError:
+        shutil.copy2(source, destination)
+        status = "reused_copy"
+    return status
 
 
 def build_initialization_tables(
@@ -1913,6 +1984,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capability-cache-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
+        "--reuse-capability-tracker-caches",
+        action="store_true",
+        help=(
+            "Reuse HOTA events and framewise assignments produced by the "
+            "immediately preceding capability-profile stage, including for "
+            "explicitly recomputed trackers."
+        ),
+    )
+    parser.add_argument(
         "--profiles-script",
         type=Path,
         default=Path(__file__).with_name(
@@ -1969,28 +2049,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--split-to-eval", type=str, default="test")
     parser.add_argument("--tracker-sub-folder", type=str, default="data")
-    parser.add_argument("--fps", type=float, default=15.0)
-    parser.add_argument("--success-iou-thr", type=float, default=0.30)
-    parser.add_argument("--matchable-sim-thr", type=float, default=0.30)
-    parser.add_argument("--pre-gap-visible-frames", type=int, default=8)
-    parser.add_argument("--max-gap-age-s", type=float, default=1.0)
+    parser.add_argument("--fps", type=float, default=defaults.FPS)
+    parser.add_argument(
+        "--success-iou-thr",
+        type=float,
+        default=defaults.SUCCESS_IOU_THRESHOLD,
+    )
+    parser.add_argument(
+        "--matchable-sim-thr",
+        type=float,
+        default=defaults.MATCHABLE_SIMILARITY_THRESHOLD,
+    )
+    parser.add_argument(
+        "--pre-gap-visible-frames",
+        type=int,
+        default=defaults.PRE_GAP_VISIBLE_FRAMES,
+    )
+    parser.add_argument(
+        "--max-gap-age-s",
+        type=float,
+        default=defaults.MAX_GAP_AGE_SECONDS,
+    )
     parser.add_argument(
         "--recovery-gap-bin-edges-frames",
         type=str,
-        default="1,4,7,10,13,16",
+        default=defaults.RECOVERY_GAP_BIN_EDGES_FRAMES,
     )
     parser.add_argument(
         "--continuity-max-detector-gap-frames",
         type=int,
-        default=3,
+        default=defaults.CONTINUITY_MAX_DETECTOR_GAP_FRAMES,
     )
-    parser.add_argument("--continuity-warmup-frames", type=int, default=8)
-    parser.add_argument("--continuity-chunk-s", type=float, default=1.0)
-    parser.add_argument("--continuity-min-nn-frames", type=int, default=3)
+    parser.add_argument(
+        "--continuity-warmup-frames",
+        type=int,
+        default=defaults.CONTINUITY_WARMUP_FRAMES,
+    )
+    parser.add_argument(
+        "--continuity-chunk-s",
+        type=float,
+        default=defaults.CONTINUITY_CHUNK_SECONDS,
+    )
+    parser.add_argument(
+        "--continuity-min-nn-frames",
+        type=int,
+        default=defaults.CONTINUITY_MIN_NN_FRAMES,
+    )
     parser.add_argument(
         "--initialization-max-s",
         type=float,
-        default=0.50,
+        default=defaults.INITIALIZATION_MAX_SECONDS,
         help=(
             "Maximum time after detector support in which a validated "
             "stable tracker run may begin. Converted with ceil(seconds*fps)."
@@ -1999,31 +2107,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--initialization-validation-s",
         type=float,
-        default=1.00,
+        default=defaults.INITIALIZATION_VALIDATION_SECONDS,
         help=(
             "Continuous correct same-ID duration required after a candidate "
             "start. Converted with ceil(seconds*fps)."
         ),
     )
-    parser.add_argument("--nn-min-m", type=float, default=0.0)
-    parser.add_argument("--nn-max-m", type=float, default=1.0)
-    parser.add_argument("--nn-bin-width-m", type=float, default=0.10)
+    parser.add_argument("--nn-min-m", type=float, default=defaults.NN_MIN_METERS)
+    parser.add_argument("--nn-max-m", type=float, default=defaults.NN_MAX_METERS)
+    parser.add_argument(
+        "--nn-bin-width-m",
+        type=float,
+        default=defaults.NN_BIN_WIDTH_METERS,
+    )
     parser.add_argument(
         "--hota-spread-quantiles",
         type=str,
-        default="0.10,0.90",
+        default=defaults.HOTA_SPREAD_QUANTILES,
     )
     parser.add_argument(
         "--profile-ci-quantiles",
         type=str,
-        default="0.025,0.975",
+        default=defaults.PROFILE_CI_QUANTILES,
     )
-    parser.add_argument("--bootstrap-replicates", type=int, default=2000)
+    parser.add_argument(
+        "--bootstrap-replicates",
+        type=int,
+        default=defaults.BOOTSTRAP_REPLICATES,
+    )
     parser.add_argument("--bootstrap-seed", type=int, default=20260727)
     parser.add_argument(
         "--runtime-min-frames-per-count",
         type=int,
-        default=1,
+        default=defaults.RUNTIME_MIN_FRAMES_PER_COUNT,
     )
     parser.add_argument("--num-workers", type=int, default=1)
     return parser
@@ -2251,6 +2367,7 @@ def main() -> int:
     cached_status_rows: list[dict[str, Any]] = []
     profile_changed_trackers: set[str] = set()
     tracker_order = {tracker: index for index, tracker in enumerate(trackers)}
+    capability_assignment_dir = capability_dir / "assignment_observations"
 
     for tracker in trackers:
         force_tracker = tracker in recompute_trackers
@@ -2273,6 +2390,11 @@ def main() -> int:
             profile_exists = profile_path.is_file()
             hota_exists = hota_path.is_file()
             assignment_exists = assignment_path.is_file()
+            reusable_assignment_exists = (
+                capability_assignment_dir
+                / safe_name(tracker)
+                / f"{sequence}.npz"
+            ).is_file()
             needs_job = bool(
                 force_tracker
                 or not profile_exists
@@ -2304,6 +2426,9 @@ def main() -> int:
                     "profile_cache_existed_before": profile_exists,
                     "hota_cache_existed_before": hota_exists,
                     "assignment_cache_existed_before": assignment_exists,
+                    "capability_assignment_available": (
+                        reusable_assignment_exists
+                    ),
                     "recompute_requested": force_tracker,
                     "scheduled": needs_job,
                     "action": action,
@@ -2342,7 +2467,20 @@ def main() -> int:
                     "hota_event_dir": str(hota_event_dir),
                     "assignment_dir": str(assignment_dir),
                     "reuse_hota_events_from": (
-                        None if force_tracker else str(capability_dir)
+                        str(capability_dir)
+                        if (
+                            not force_tracker
+                            or args.reuse_capability_tracker_caches
+                        )
+                        else None
+                    ),
+                    "reuse_assignment_observations_from": (
+                        str(capability_dir / "assignment_observations")
+                        if (
+                            not force_tracker
+                            or args.reuse_capability_tracker_caches
+                        )
+                        else None
                     ),
                     "split_to_eval": args.split_to_eval,
                     "tracker_sub_folder": args.tracker_sub_folder,
@@ -2371,6 +2509,10 @@ def main() -> int:
                 "assignment_cache_existed_before",
                 "sum",
             ),
+            n_capability_assignments_available=(
+                "capability_assignment_available",
+                "sum",
+            ),
             n_jobs_scheduled=("scheduled", "sum"),
             recompute_requested=("recompute_requested", "max"),
         )
@@ -2386,7 +2528,7 @@ def main() -> int:
         _direct_tracker_sequence_worker,
         jobs,
         args.num_workers,
-        "Missing/recomputed tracker-sequence results",
+        "Final tracker-sequence tables",
     )
     action_by_key = {
         (row["tracker"], row["seq"]): row["action"]
