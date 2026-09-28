@@ -10,6 +10,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence
 
+from tracker_eval.common.odometry_transform import (
+    DEFAULT_DETECTION_YAW_CONVENTION,
+    DEFAULT_GT_YAW_CONVENTION,
+    YawConvention,
+    validate_yaw_convention,
+)
 from tracker_eval.data.jrdb_io import (
     list_sequence_jsons,
     sequence_name_from_json_filename,
@@ -58,6 +64,8 @@ class BatchRunRequest:
     skip_existing_kitti: bool = True
     global_coords: bool = False
     odometry_root: str = ""
+    detection_yaw_convention: YawConvention = DEFAULT_DETECTION_YAW_CONVENTION
+    gt_yaw_convention: YawConvention = DEFAULT_GT_YAW_CONVENTION
 
 
 @dataclass
@@ -72,6 +80,8 @@ class _PreparedRun:
 
 
 def _prepare_run(index: int, request: BatchRunRequest) -> _PreparedRun:
+    validate_yaw_convention(request.detection_yaw_convention)
+    validate_yaw_convention(request.gt_yaw_convention)
     split_root = Path(request.split_root)
     detections_dir = split_root / request.detections_subdir
     if not detections_dir.exists():
@@ -136,6 +146,8 @@ def _prepare_run(index: int, request: BatchRunRequest) -> _PreparedRun:
                 "use_gt_if_available": request.use_gt_if_available,
                 "global_coords": request.global_coords,
                 "odometry_root": request.odometry_root,
+                "detection_yaw_convention": request.detection_yaw_convention,
+                "gt_yaw_convention": request.gt_yaw_convention,
             }
         )
 
@@ -193,6 +205,12 @@ def _summary_for_run(prepared: _PreparedRun) -> SplitRunSummary:
             "out_root": request.out_root,
             "tracker_dir": str(prepared.tracker_dir),
             "kitti_dir": str(prepared.kitti_dir),
+            "global_coords": request.global_coords,
+            "detection_yaw_convention": request.detection_yaw_convention,
+            "gt_yaw_convention": request.gt_yaw_convention,
+            "yaw_decoding_applied": True,
+            "internal_yaw_convention": "standard_ccw",
+            "global_yaw_convention": "standard_ccw" if request.global_coords else None,
         },
     )
     _write_json(

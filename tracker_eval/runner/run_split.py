@@ -28,8 +28,13 @@ from tracker_eval.runner.run_sequence import (
 )
 
 from tracker_eval.common.odometry_transform import (
+    DEFAULT_DETECTION_YAW_CONVENTION,
+    DEFAULT_GT_YAW_CONVENTION,
+    YawConvention,
+    validate_yaw_convention,
     load_odometry_csv,
     transform_sequence_to_global,
+    normalize_sequence_yaw,
     build_timestamps_by_frame_from_odometry,
 )
 
@@ -281,8 +286,14 @@ def _run_one_sequence_worker(job: Dict[str, Any]) -> Dict[str, Any]:
 
     global_coords = bool(job.get("global_coords", False))
     odometry_root = Path(str(job.get("odometry_root", "")))
+    detection_yaw_convention = job.get(
+        "detection_yaw_convention", DEFAULT_DETECTION_YAW_CONVENTION,
+    )
+    gt_yaw_convention = job.get("gt_yaw_convention", DEFAULT_GT_YAW_CONVENTION)
 
     try:
+        validate_yaw_convention(detection_yaw_convention)
+        validate_yaw_convention(gt_yaw_convention)
         # Build tracker instance inside this process
         tracker = _build_tracker_from_spec(tracker_spec)
 
@@ -304,12 +315,28 @@ def _run_one_sequence_worker(job: Dict[str, Any]) -> Dict[str, Any]:
             pose_by_idx = load_odometry_csv(str(odo_csv))
 
             # Transform detections and GT into global coordinates
-            dets_by_frame = transform_sequence_to_global(dets_by_frame, pose_by_idx)
+            dets_by_frame = transform_sequence_to_global(
+                dets_by_frame, pose_by_idx,
+                yaw_convention=detection_yaw_convention,
+            )
             if gt_by_frame is not None:
-                gt_by_frame = transform_sequence_to_global(dict(gt_by_frame), pose_by_idx)
+                gt_by_frame = transform_sequence_to_global(
+                    dict(gt_by_frame), pose_by_idx,
+                    yaw_convention=gt_yaw_convention,
+                )
 
             # Provide timestamps to tracker if it uses them
             timestamps_by_frame = build_timestamps_by_frame_from_odometry(str(odo_csv), dets_by_frame)
+        else:
+            # Local tracking still requires canonical CCW yaw. Keep centers local.
+            # Global conversion above already decodes yaw; these branches are exclusive.
+            dets_by_frame = normalize_sequence_yaw(
+                dets_by_frame, yaw_convention=detection_yaw_convention,
+            )
+            if gt_by_frame is not None:
+                gt_by_frame = normalize_sequence_yaw(
+                    dict(gt_by_frame), yaw_convention=gt_yaw_convention,
+                )
 
         tracks_by_frame, stats, frame_stats = run_tracker_on_sequence(
             seq_name=seq_name,
@@ -418,12 +445,16 @@ def run_tracker_on_split(
     # Global coordinate option
     global_coords: bool = False,
     odometry_root: Union[str, Path] = "",
+    detection_yaw_convention: YawConvention = DEFAULT_DETECTION_YAW_CONVENTION,
+    gt_yaw_convention: YawConvention = DEFAULT_GT_YAW_CONVENTION,
 ) -> SplitRunSummary:
     """
     Sequential mode: original behavior (timing + per-frame stats written).
     Parallel mode: sequences processed concurrently (one tracker instance per sequence),
                    timing/per-frame profiling disabled.
     """
+    validate_yaw_convention(detection_yaw_convention)
+    validate_yaw_convention(gt_yaw_convention)
     if not write_kitti_txt:
         raise ValueError(
             "KITTI output is required because it is the input to the evaluation pipeline."
@@ -531,12 +562,28 @@ def run_tracker_on_split(
                 pose_by_idx = load_odometry_csv(str(odo_csv))
 
                 # Transform detections and GT into global coordinates
-                dets_by_frame = transform_sequence_to_global(dets_by_frame, pose_by_idx)
+                dets_by_frame = transform_sequence_to_global(
+                    dets_by_frame, pose_by_idx,
+                    yaw_convention=detection_yaw_convention,
+                )
                 if gt_by_frame is not None:
-                    gt_by_frame = transform_sequence_to_global(dict(gt_by_frame), pose_by_idx)
+                    gt_by_frame = transform_sequence_to_global(
+                        dict(gt_by_frame), pose_by_idx,
+                        yaw_convention=gt_yaw_convention,
+                    )
 
                 # Provide timestamps (seconds) derived from odometry CSV
                 timestamps_by_frame = build_timestamps_by_frame_from_odometry(str(odo_csv), dets_by_frame)
+            else:
+                # Local tracking still requires canonical CCW yaw. Keep centers local.
+                # Global conversion above already decodes yaw; these branches are exclusive.
+                dets_by_frame = normalize_sequence_yaw(
+                    dets_by_frame, yaw_convention=detection_yaw_convention,
+                )
+                if gt_by_frame is not None:
+                    gt_by_frame = normalize_sequence_yaw(
+                        dict(gt_by_frame), yaw_convention=gt_yaw_convention,
+                    )
 
             # Run sequence (NOTE: frames=None is OK, because run_tracker_on_sequence unions det+GT keys)
             tracks_by_frame, stats, frame_stats = run_tracker_on_sequence(
@@ -643,6 +690,8 @@ def run_tracker_on_split(
 
                     "global_coords": bool(global_coords),
                     "odometry_root": str(odometry_root),
+                    "detection_yaw_convention": detection_yaw_convention,
+                    "gt_yaw_convention": gt_yaw_convention,
 
                 }
             )
@@ -742,6 +791,12 @@ def run_tracker_on_split(
             "out_root": str(out_root),
             "tracker_dir": str(tracker_dir),
             "kitti_dir": str(out_kitti_dir),
+            "global_coords": bool(global_coords),
+            "detection_yaw_convention": detection_yaw_convention,
+            "gt_yaw_convention": gt_yaw_convention,
+            "yaw_decoding_applied": True,
+            "internal_yaw_convention": "standard_ccw",
+            "global_yaw_convention": "standard_ccw" if global_coords else None,
         },
     )
 

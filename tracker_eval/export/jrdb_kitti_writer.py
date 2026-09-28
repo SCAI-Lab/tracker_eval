@@ -69,7 +69,9 @@ def trackeval_xyzwhd_from_internal_center(box7_center: np.ndarray) -> np.ndarray
       - x forward, y left, z up
       - center-based
       - l along +x, w along +y, h along +z
-      - rot_z about +z
+      - rot_z is canonical positive-CCW about +z, for local and global runs
+        (source CW/CCW decoding happens before tracker execution/GT export)
+      - direct callers must also normalize source yaw before invoking the writer
 
     TrackEval JRDB3DBox expects columns 10..16 to be:
       (x, y, z, w, h, d, yaw)   where box_format='xyzwhd'
@@ -100,6 +102,8 @@ def trackeval_xyzwhd_from_internal_center(box7_center: np.ndarray) -> np.ndarray
     x = -cy
     y = -cz + 0.5 * h
     z = cx
+    # Output-format axis/yaw conversion, not JRDB source-yaw decoding.
+    # Keep consistent with the bundled evaluator and inverse TXT readers.
     yaw = _wrap_to_2pi(-rot_z)
 
     w_out = w

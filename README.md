@@ -107,16 +107,55 @@ The output of a tracker is not JSON ground truth; it is the same KITTI/JRDB text
 
 ## Coordinate and export transforms
 
-The important transforms are centralized and applied identically to detections and source GT:
+Yaw decoding and local-to-global conversion are centralized. Detections and source GT select their source yaw encodings independently. Both local and global tracker runs receive canonical positive-CCW yaw:
 
 | Stage | Operation | Implementation |
 |---|---|---|
+| local-only JRDB source (default) | `yaw_local_ccw = -rot_z`; centers unchanged | `normalize_frame_data_yaw`, `normalize_sequence_yaw` |
+| local-only standard CCW source | `yaw_local_ccw = rot_z`; centers unchanged | same helpers, with `yaw_convention="standard_ccw"` |
 | local → global | `p_global = R(q) @ p_local + t` | `transform_box7_local_to_global` in `common/odometry_transform.py` |
-| JRDB yaw compensation | `yaw_global = yaw_local - ego_yaw` | same function; this empirical sign is required by the existing JRDB pipeline |
+| JRDB clockwise source (default) | `yaw_global_ccw = -rot_z + ego_yaw` | `decode_local_yaw_to_ccw`, then `transform_box7_local_to_global` |
+| Standard CCW source | `yaw_global_ccw = rot_z + ego_yaw` | same functions, with `yaw_convention="standard_ccw"` |
 | sequence transform | pose row selected by integer frame key | `load_odometry_csv`, `transform_frame_data_to_global`, `transform_sequence_to_global` |
 | internal → TrackEval | `x=-cy`, `y=-cz+h/2`, `z=cx`, `w=w`, `h=h`, `d=l`, `yaw=(-rot_z) mod 2π` | `trackeval_xyzwhd_from_internal_center` in `export/jrdb_kitti_writer.py` |
 
 The odometry CSV is treated as `T_world_sensor`. Global transformation happens in `runner/run_split.py` before a tracker step; `tracker-eval-prepare-gt --global-coords` applies the same transform when building global evaluation GT.
+
+**Why two formulas?** They describe two encodings of the same local orientation,
+not two different odometry transforms. JRDB `rot_z` in this base-frame pipeline
+is clockwise-positive (verified from train/test visualizations). A conventional
+XY rotation matrix instead takes positive-CCW angles, so JRDB source yaw must
+first be decoded as `yaw_local_ccw = -rot_z`. Ordinary pose composition then adds
+`ego_yaw`. A source already using CCW skips the sign flip. In both cases the
+output is wrapped to `[-pi, pi)`.
+
+The default is `jrdb_clockwise` for **both GT and detections** because this project
+uses JRDB labels and the original JRDB-trained PersonMinkUNet detection files. 
+
+The runner accepts `--detection-yaw-convention` and `--gt-yaw-convention`, each with choices `jrdb_clockwise` and `standard_ccw`. **Both flags apply to local and global runs.** Without
+`--global_coords`, yaw is decoded and wrapped, centers remain in the robot-local
+frame, and no odometry is needed. With `--global_coords`, the selected source yaw
+is decoded inside the global transform, ego yaw is added, and centers are
+transformed using odometry. Decoding occurs exactly once in either branch.
+The raw JSON loaders still preserve source values; normalization happens at the
+runner/GT-export boundary, without rewriting source JSON or pseudo detections.
+
+For an external detector that saves CCW yaw, keep JRDB GT decoding independent:
+
+```bash
+tracker-eval \
+  --split_root /data/JRDB/test --split_name test \
+  --out_root /data/tracker_outputs_yaw_corrected \
+  --trackers ab3dmot \
+  --global_coords --odometry_root /data/JRDB/odometry \
+  --detection-yaw-convention standard_ccw \
+  --gt-yaw-convention jrdb_clockwise
+```
+
+For the equivalent local-only tracker run, omit `--global_coords` and
+`--odometry_root` from the command above; keep the same two convention flags.
+These flags select input encoding, not the output coordinate frame.
+
 
 ### Tracker output text
 

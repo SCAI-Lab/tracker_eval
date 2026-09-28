@@ -9,6 +9,11 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import yaml
 
+from tracker_eval.common.odometry_transform import (
+    DEFAULT_DETECTION_YAW_CONVENTION,
+    DEFAULT_GT_YAW_CONVENTION,
+    YAW_CONVENTIONS,
+)
 from tracker_eval.runner.run_batch import BatchRunRequest, run_batch
 from tracker_eval.runner.run_split import (
     _build_tracker_from_spec,
@@ -191,6 +196,27 @@ def build_argparser(
 
     parser.add_argument("--global_coords", action="store_true")
     parser.add_argument("--odometry_root", default="")
+    parser.add_argument(
+        "--detection-yaw-convention", "--detection_yaw_convention",
+        choices=YAW_CONVENTIONS,
+        default=DEFAULT_DETECTION_YAW_CONVENTION,
+        help=(
+            "Source detection yaw encoding for local and global runs. Default: "
+            "jrdb_clockwise for this project's JRDB-trained PersonMinkUNet "
+            "outputs; use standard_ccw for already-CCW detector outputs. "
+            "Decoded to CCW before tracking; --global_coords also applies odometry."
+        ),
+    )
+    parser.add_argument(
+        "--gt-yaw-convention", "--gt_yaw_convention",
+        choices=YAW_CONVENTIONS,
+        default=DEFAULT_GT_YAW_CONVENTION,
+        help=(
+            "Source GT yaw encoding for local and global runs; default "
+            "jrdb_clockwise for JRDB labels. Independent of detection yaw. "
+            "Decoded to CCW before GT-assisted tracking."
+        ),
+    )
 
     group = parser.add_argument_group("AB3DMOT parameters")
     group.add_argument("--ab3dmot_max_age", type=int, default=15)
@@ -568,6 +594,8 @@ def make_requests(
                             skip_existing_kitti=not args.no_skip_existing,
                             global_coords=bool(args.global_coords),
                             odometry_root=str(args.odometry_root),
+                            detection_yaw_convention=args.detection_yaw_convention,
+                            gt_yaw_convention=args.gt_yaw_convention,
                         )
                     )
     return requests
@@ -610,6 +638,8 @@ def execute_requests(
                     parallel=False,
                     global_coords=request.global_coords,
                     odometry_root=request.odometry_root,
+                    detection_yaw_convention=request.detection_yaw_convention,
+                    gt_yaw_convention=request.gt_yaw_convention,
                 )
             )
     failures = [

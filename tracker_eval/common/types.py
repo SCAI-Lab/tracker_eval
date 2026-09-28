@@ -12,11 +12,14 @@ Number = Union[int, float]
 @dataclass(frozen=True)
 class Box3D:
     """
-    JRDB box convention:
-        cx, cy, cz, l, w, h, rot_z
+    Center-based box layout: cx, cy, cz, l, w, h, rot_z.
 
-    Units: meters and radians.
-    Coordinate frame: JRDB "base" (x forward, y left, z up) per your pipeline.
+    Units: meters and radians. Source JSON loaders preserve source yaw encoding
+    in the JRDB base frame (x forward, y left, z up). Before tracking/export,
+    the runner/GT exporter decodes source yaw exactly once to canonical CCW
+    about +z, in both local and global runs. Centers remain local unless the
+    global transform is requested. Raw loaders still preserve source encoding;
+    this container stores no frame tag and cannot detect double decoding.
     """
     cx: float
     cy: float

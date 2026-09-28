@@ -2,13 +2,42 @@ from __future__ import annotations
 
 import csv
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import numpy as np
 
 from tracker_eval.common.types import Box3D, Detection, FrameData
+
+
+# These describe SOURCE local yaw encoding, not the output coordinate frame.
+YawConvention = Literal["jrdb_clockwise", "standard_ccw"]
+YAW_CONVENTIONS = ("jrdb_clockwise", "standard_ccw")
+DEFAULT_DETECTION_YAW_CONVENTION: YawConvention = "jrdb_clockwise"
+DEFAULT_GT_YAW_CONVENTION: YawConvention = "jrdb_clockwise"
+
+
+def validate_yaw_convention(convention: str) -> None:
+    if convention not in YAW_CONVENTIONS:
+        raise ValueError(f"Unsupported yaw convention: {convention!r}; choose {YAW_CONVENTIONS}")
+
+
+def decode_local_yaw_to_ccw(rot_z: float, convention: YawConvention) -> float:
+    """Decode source yaw into positive-CCW local yaw (radians about +z).
+
+    JRDB labels use clockwise-positive rot_z in this base-frame pipeline,
+    as verified on train/test sequences. The default for the original
+    JRDB-trained PersonMinkUNet detections assumes they retain that target
+    encoding. Select standard_ccw if a detector outputs in CCW convention.
+    """
+    validate_yaw_convention(convention)
+    return -float(rot_z) if convention == "jrdb_clockwise" else float(rot_z)
+
+
+def wrap_to_pi(angle: float) -> float:
+    """Wrap radians to [-pi, pi)."""
+    return float((angle + math.pi) % (2.0 * math.pi) - math.pi)
 
 
 @dataclass(frozen=True)
@@ -86,12 +115,9 @@ def _world_from_sensor_terms(
     pose: Pose,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """
-    Return the exact (R, t, yaw) terms used by this package for local->global.
+    Return (R_world_sensor, t_world_sensor, ego_yaw_ccw).
 
-    The package convention is intentionally kept in one function. In
-    particular, JRDB yaw uses the package's empirical
-    ``yaw_global = yaw_local - ego_yaw`` rule rather than standard yaw
-    composition.
+    These pose terms do not depend on the source box yaw encoding.
     """
     qx, qy, qz, qw = (
         float(pose.q[0]),
@@ -109,16 +135,23 @@ def _world_from_sensor_terms(
 def transform_box7_local_to_global(
     box7: np.ndarray,
     pose: Pose,
+    *,
+    yaw_convention: YawConvention = "jrdb_clockwise",
 ) -> np.ndarray:
-    """
-    Transform ``[cx,cy,cz,l,w,h,rot_z]`` with the package's exact convention.
+    """Transform a source-local box into canonical global positive-CCW form.
+
+    Position uses p_world = R @ p_local + t. Yaw first decodes the source:
+      jrdb_clockwise (default): yaw_world_ccw = -rot_z + ego_yaw_ccw
+      standard_ccw:             yaw_world_ccw =  rot_z + ego_yaw_ccw
+    The yaw-only box representation retains the existing planar orientation
+    approximation for poses with roll/pitch; dimensions are unchanged.
     """
     b = np.asarray(box7, dtype=np.float64).reshape(7)
     R, t, yaw = _world_from_sensor_terms(pose)
     out = b.copy()
     out[:3] = (R @ b[:3]) + t
-    # Deliberately non-standard JRDB/package yaw rule. Do not change.
-    out[6] = float(b[6] - yaw)
+    local_yaw_ccw = decode_local_yaw_to_ccw(b[6], yaw_convention)
+    out[6] = wrap_to_pi(local_yaw_ccw + yaw)
     return out
 
 
@@ -126,13 +159,17 @@ def transform_frame_data_to_global(
     fd: FrameData,
     pose_by_frame_idx: Dict[int, Pose],
     *,
+    yaw_convention: YawConvention = "jrdb_clockwise",
     missing_ok: bool = False,
 ) -> FrameData:
     """
     Transform all detections in FrameData from local->global using pose for this frame.
 
-    The CSV pose is T_world_sensor: p_w = R p_s + t.
+    The CSV pose is T_world_sensor: p_w = R p_s + t. Output yaw is CCW.
+    With missing_ok=True, a missing pose returns the source frame unchanged;
+    runners use the strict default to avoid mixing local and global frames.
     """
+    validate_yaw_convention(yaw_convention)
     k = _frame_id_to_int(fd.frame_id)
     pose = pose_by_frame_idx.get(k, None)
     if pose is None:
@@ -147,7 +184,9 @@ def transform_frame_data_to_global(
             [b.cx, b.cy, b.cz, b.l, b.w, b.h, b.rot_z],
             dtype=np.float64,
         )
-        global_box7 = transform_box7_local_to_global(local_box7, pose)
+        global_box7 = transform_box7_local_to_global(
+            local_box7, pose, yaw_convention=yaw_convention,
+        )
 
         bw = Box3D(
             cx=float(global_box7[0]),
@@ -156,11 +195,7 @@ def transform_frame_data_to_global(
             l=float(global_box7[3]),
             w=float(global_box7[4]),
             h=float(global_box7[5]),
-            # NOTE (JRDB yaw sign fix):
-            # Empirically, JRDB labels/detections in the local (base) frame already rotate with ego motion
-            # as if an ego-compensation was applied with the wrong sign. If we compose yaw "correctly"
-            # (rot_z + ego_yaw), boxes spin/double-rotate when the robot turns.
-            # Therefore we apply the *reverse* composition here: subtract ego yaw.
+            # Source yaw has been decoded to CCW and composed with ego yaw.
             rot_z=float(global_box7[6]),
         )
 
@@ -181,11 +216,52 @@ def transform_frame_data_to_global(
 def transform_sequence_to_global(
     data_by_frame: Dict[str, FrameData],
     pose_by_frame_idx: Dict[int, Pose],
+    *,
+    yaw_convention: YawConvention = "jrdb_clockwise",
 ) -> Dict[str, FrameData]:
+    """Convert source-local frames to global boxes with canonical CCW yaw."""
+    validate_yaw_convention(yaw_convention)
     out: Dict[str, FrameData] = {}
     for fid, fd in data_by_frame.items():
-        out[fid] = transform_frame_data_to_global(fd, pose_by_frame_idx)
+        out[fid] = transform_frame_data_to_global(
+            fd, pose_by_frame_idx, yaw_convention=yaw_convention,
+        )
     return out
+
+
+def normalize_frame_data_yaw(
+    fd: FrameData,
+    *,
+    yaw_convention: YawConvention = "jrdb_clockwise",
+) -> FrameData:
+    """Decode source-local yaw to canonical local CCW without moving boxes.
+
+    Use for local-only tracking/export. Global transforms already decode source
+    yaw themselves: do not normalize first and then pass jrdb_clockwise to a
+    global transform, as that would flip the sign twice. Inputs are not mutated;
+    centers, dimensions, IDs, scores and other detection metadata are preserved.
+    """
+    validate_yaw_convention(yaw_convention)
+    return replace(fd, dets=[
+        replace(det, box=replace(
+            det.box,
+            rot_z=wrap_to_pi(decode_local_yaw_to_ccw(det.box.rot_z, yaw_convention)),
+        ))
+        for det in fd.dets
+    ])
+
+
+def normalize_sequence_yaw(
+    data_by_frame: Dict[str, FrameData],
+    *,
+    yaw_convention: YawConvention = "jrdb_clockwise",
+) -> Dict[str, FrameData]:
+    """Normalize source yaw for a local-only sequence; no odometry is needed."""
+    validate_yaw_convention(yaw_convention)
+    return {
+        fid: normalize_frame_data_yaw(fd, yaw_convention=yaw_convention)
+        for fid, fd in data_by_frame.items()
+    }
 
 
 def build_timestamps_by_frame_from_odometry(

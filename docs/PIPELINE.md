@@ -9,6 +9,18 @@ ODOMETRY_ROOT=/data/JRDB/odometry
 OUTPUT_ROOT=/data/tracker_outputs
 ```
 
+## Yaw conventions for local and global runs
+
+Both GT and the original PersonMinkUNet detection files default to
+`jrdb_clockwise` as JRDB yaw is CW encoded. Local-only runs decode source yaw as `yaw_local_ccw = -rot_z`
+without changing centers or requiring odometry. Global runs use
+`yaw_global_ccw = -rot_z + ego_yaw` and transform centers with the pose.
+
+For an external detector whose saved output is already CCW, add
+`--detection-yaw-convention standard_ccw --gt-yaw-convention jrdb_clockwise` to the
+tracker command. Its yaw is then `rot_z` locally or `rot_z + ego_yaw` globally.
+Both flags work with or without `--global_coords`; decoding happens exactly once.
+
 ## 1. Optional measured score distribution
 
 The packaged pseudo specification uses constant confidence `1.0`, so it runs without another artifact. To sample the same measured score realization across conditions, first build a distribution and change `score_mode` to `sample` or pass the resulting file with `--score_dists`:

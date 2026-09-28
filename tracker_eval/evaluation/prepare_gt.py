@@ -7,8 +7,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from tracker_eval.common.odometry_transform import (
+    DEFAULT_GT_YAW_CONVENTION,
+    YAW_CONVENTIONS,
+    YawConvention,
+    validate_yaw_convention,
     load_odometry_csv,
     transform_frame_data_to_global,
+    normalize_frame_data_yaw,
 )
 from tracker_eval.common.types import Box3D, Detection, FrameData
 from tracker_eval.export.jrdb_kitti_writer import TrackRow3D, write_sequence_kitti_txt
@@ -25,7 +30,10 @@ def prepare_gt(
     gt_folder: Path,
     split: str,
     odometry_root: Optional[Path] = None,
+    *,
+    yaw_convention: YawConvention = DEFAULT_GT_YAW_CONVENTION,
 ) -> None:
+    validate_yaw_convention(yaw_convention)
     label_output = gt_folder / "label_02"
     label_output.mkdir(parents=True, exist_ok=True)
     seqmap_rows: List[str] = []
@@ -65,7 +73,15 @@ def prepare_gt(
                 )
             frame_data = FrameData(frame_id=frame, dets=detections)
             if poses is not None:
-                frame_data = transform_frame_data_to_global(frame_data, poses)
+                frame_data = transform_frame_data_to_global(
+                    frame_data, poses, yaw_convention=yaw_convention,
+                )
+            else:
+                # Local GT uses the same CCW internal geometry as local trackers.
+                # Global conversion above performs its own source-yaw decoding.
+                frame_data = normalize_frame_data_yaw(
+                    frame_data, yaw_convention=yaw_convention,
+                )
             output_rows = [
                 TrackRow3D(
                     track_id=int(detection.track_id),
@@ -112,6 +128,16 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Root containing <split>/odometry/<sequence>.csv.",
     )
+    parser.add_argument(
+        "--yaw-convention",
+        choices=YAW_CONVENTIONS,
+        default=DEFAULT_GT_YAW_CONVENTION,
+        help=(
+            "Source GT yaw encoding for local and global exports; default "
+            "jrdb_clockwise for JRDB JSON. Both use CCW internally. "
+            "--global-coords additionally transforms centers and adds ego yaw."
+        ),
+    )
     return parser
 
 
@@ -126,6 +152,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.gt_folder,
         str(args.split),
         args.odometry_root if args.global_coords else None,
+        yaw_convention=args.yaw_convention,
     )
     return 0
 
